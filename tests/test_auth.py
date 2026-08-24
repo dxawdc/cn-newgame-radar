@@ -61,6 +61,16 @@ class AuthApiTest(unittest.TestCase):
         conn.close()
         return game_key
 
+    def test_existing_superadmin_does_not_require_bootstrap_environment(self):
+        conn = connect(webapp.DB_PATH)
+        try:
+            with patch.dict("os.environ", {}, clear=True):
+                user = auth.bootstrap_superadmin(conn)
+        finally:
+            conn.close()
+        self.assertEqual(user["username"], "test_superadmin")
+        self.assertEqual(user["role"], "superadmin")
+
     def test_bootstrap_profile_favorite_filter_and_export(self):
         csrf = self.login()
         me = self.client.get("/api/auth/me").json()

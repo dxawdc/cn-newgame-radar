@@ -88,6 +88,12 @@ def public_user(row: sqlite3.Row | dict) -> dict:
 
 
 def bootstrap_superadmin(conn: sqlite3.Connection) -> dict:
+    existing = conn.execute(
+        "SELECT * FROM users WHERE role='superadmin' ORDER BY id LIMIT 1"
+    ).fetchone()
+    if existing:
+        return public_user(existing)
+
     username = os.environ.get("NEWGAME_BOOTSTRAP_USERNAME", "").strip()
     password = os.environ.get("NEWGAME_BOOTSTRAP_PASSWORD", "")
     if not username or not password:
