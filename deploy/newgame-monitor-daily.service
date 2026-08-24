@@ -1,0 +1,17 @@
+[Unit]
+Description=国内新游监控每日采集
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=newgame-monitor
+Group=newgame-monitor
+WorkingDirectory=/opt/newgame-monitor/current
+Environment=PYTHONPATH=/opt/newgame-monitor/current/src
+Environment=TZ=Asia/Shanghai
+ExecStart=/usr/bin/flock -n /run/lock/newgame-monitor-collector.lock /opt/newgame-monitor/venv/bin/python -m newgame_monitor.cli --sources taptap ios-cn xiaomi vivo 4399 233 3839 9game --db /opt/newgame-monitor/current/data/newgame_monitor.db --raw-dir /opt/newgame-monitor/current/raw --icon-dir /opt/newgame-monitor/current/data/icons --screenshot-dir /opt/newgame-monitor/current/data/screenshots
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

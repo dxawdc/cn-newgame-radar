@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="国内游戏分发渠道新游、首发、预约与测试事件聚合看板">
+  <title>新游雷达 · Release Radar</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/app.css?v=20260824-gallery-lightbox">
+</head>
+<body>
+  <a class="skip-link" href="#catalogTitle">跳到新游列表</a>
+  <div class="scanline" aria-hidden="true"></div>
+  <header class="masthead">
+    <a class="brand" href="./" aria-label="新游雷达首页">
+      <span class="brand-mark"><i></i><i></i><i></i></span>
+      <span><strong>新游雷达</strong><small>RELEASE RADAR / CN</small></span>
+    </a>
+    <div class="mast-actions">
+      <div class="mast-meta">
+        <span id="healthDot" class="health-dot"></span>
+        <span id="lastUpdated">正在读取情报库…</span>
+        <span class="issue">NO. <b id="issueNo">—</b></span>
+      </div>
+      <button id="accountButton" class="account-trigger" type="button" aria-haspopup="dialog">
+        <span id="accountAvatar" class="account-avatar">访</span>
+        <span><strong id="accountLabel">账号登录</strong><small id="accountRole">保存关注与导出列表</small></span>
+        <i aria-hidden="true">↗</i>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">国内游戏分发渠道 · 上线 / 首发 / 测试 / 预约</p>
+        <h1>今天，有什么<br><em>新游戏</em>出现？</h1>
+        <p class="hero-note">同款产品自动合并，保留所有来源证据。日期既包含渠道公布的事件日，也标记首次采集发现日。</p>
+      </div>
+      <div class="metric-board" aria-label="新游统计">
+        <button class="metric primary" data-period="day"><span>今日</span><strong id="metricToday">—</strong><small>个产品事件</small></button>
+        <button class="metric" data-period="week"><span>本周</span><strong id="metricWeek">—</strong><small>自然周</small></button>
+        <button class="metric" data-period="month"><span>本月</span><strong id="metricMonth">—</strong><small>自然月</small></button>
+        <button class="metric" data-period="all"><span>产品库</span><strong id="metricAll">—</strong><small id="metricSources">— 个渠道</small></button>
+      </div>
+    </section>
+
+    <section class="calendar-section" aria-labelledby="calendarTitle">
+      <div class="section-kicker"><span>01</span><h2 id="calendarTitle">日期筛选</h2><p>快速限定范围；需要时再展开事件日历</p></div>
+      <div class="date-workbench" id="dateWorkbench">
+        <div class="date-workbench-copy">
+          <span>CUSTOM RANGE</span>
+          <strong>自定义日期</strong>
+          <small id="dateRangeStatus">当前按今日查看</small>
+        </div>
+        <div class="date-range-controls">
+          <label><span>开始日期</span><input id="dateFrom" type="date" aria-label="开始日期"></label>
+          <b>至</b>
+          <label><span>结束日期</span><input id="dateTo" type="date" aria-label="结束日期"></label>
+          <button id="applyDateRange" class="date-primary" type="button">查看范围</button>
+          <button id="clearDateRange" class="date-secondary" type="button" hidden>清除</button>
+        </div>
+        <div class="date-presets" aria-label="快捷日期范围">
+          <button type="button" data-range-preset="today">今天</button>
+          <button type="button" data-range-preset="next7">未来 7 天</button>
+          <button type="button" data-range-preset="next30">未来 30 天</button>
+        </div>
+      </div>
+      <details class="calendar-details" id="calendarDetails">
+        <summary>
+          <span class="calendar-summary-title"><strong>事件日历</strong><small id="calendarSelectionHint">点击日期即可查看当天事件</small></span>
+          <span class="calendar-summary-window" id="calendarWindow">正在读取日期…</span>
+          <span class="calendar-summary-action"><b>展开 28 天</b><i aria-hidden="true">↓</i></span>
+        </summary>
+        <div class="calendar-expanded">
+          <nav class="calendar-nav" aria-label="切换日历周期">
+            <button id="prevCalendar" type="button" aria-label="上一个四周">← 上四周</button>
+            <button id="todayCalendar" type="button">回到今天</button>
+            <button id="nextCalendar" type="button" aria-label="下一个四周">下四周 →</button>
+          </nav>
+          <div id="calendarRail" class="calendar-rail" aria-live="polite"></div>
+        </div>
+      </details>
+    </section>
+
+    <section class="catalog-section">
+      <aside class="filters" id="filtersPanel">
+        <div class="filter-heading">
+          <div><span>FILTER DESK</span><h2>筛选情报</h2></div>
+          <button id="clearFilters" class="text-btn">全部清除</button>
+        </div>
+        <label class="search-box">
+          <span>搜索</span>
+          <input id="searchInput" type="search" placeholder="游戏名 / 厂商 / 玩法">
+          <kbd>⌘ K</kbd>
+        </label>
+        <div class="filter-block">
+          <h3>事件类型</h3>
+          <div id="eventFilters" class="chip-list"></div>
+        </div>
+        <div class="filter-block">
+          <h3>来源渠道</h3>
+          <div id="sourceFilters" class="source-filter-list"></div>
+        </div>
+        <div class="filter-block two-selects">
+          <label><span>游戏品类</span><select id="categorySelect"><option value="">全部品类</option></select></label>
+          <label><span>开发 / 发行商</span><select id="developerSelect"><option value="">全部厂商</option></select></label>
+        </div>
+        <div id="followFilterBlock" class="filter-block follow-filter-block" hidden>
+          <h3>个人关注</h3>
+          <button id="followedOnly" class="followed-filter" type="button"><span>只看已关注</span><strong id="favoriteCount">0</strong></button>
+          <a id="exportFavorites" class="export-followed" href="api/favorites/export.csv">下载关注产品信息 CSV ↘</a>
+        </div>
+        <div class="scope-note"><i></i><p>采集范围仅限普通用户可见的新游与测试业务页面；每条数据保留原始响应或 UI 证据。</p></div>
+      </aside>
+
+      <div class="catalog">
+        <div class="catalog-toolbar">
+          <div>
+            <p class="eyebrow">LIVE CATALOG</p>
+            <h2 id="catalogTitle">今日新游</h2>
+            <p id="resultMeta">正在加载…</p>
+          </div>
+          <div class="toolbar-actions">
+            <button class="mobile-filter" id="mobileFilter">筛选 <span id="activeFilterCount">0</span></button>
+            <label class="sort-select">排序
+              <select id="sortSelect">
+                <option value="event_desc">日期从近到远</option>
+                <option value="event_asc">日期从远到近</option>
+                <option value="sources_desc">覆盖渠道最多</option>
+                <option value="name_asc">名称 A–Z</option>
+              </select>
+            </label>
+            <div class="view-switch" aria-label="视图切换">
+              <button id="gridView" class="active" title="卡片视图">▦</button>
+              <button id="listView" title="列表视图">☷</button>
+            </div>
+          </div>
+        </div>
+        <div id="activeFilters" class="active-filters"></div>
+        <div id="gameGrid" class="game-grid" aria-live="polite"></div>
+        <div id="emptyState" class="empty-state" hidden><span>∅</span><h3>没有命中当前条件</h3><p>试试放宽日期、渠道或事件类型。</p></div>
+        <nav class="pagination" aria-label="分页">
+          <button id="prevPage">← 上一页</button><span id="pageInfo">1 / 1</span><button id="nextPage">下一页 →</button>
+        </nav>
+      </div>
+    </section>
+  </main>
+
+  <footer><span>NEW GAME INTELLIGENCE DESK</span><p>TapTap · 华为 · 荣耀 · 小米 · OPPO · vivo · 4399 · 233 · 好游快爆 · UC 九游 · App Store 中国区（数据不全）</p><span id="footerCount">— EVENTS INDEXED</span></footer>
+
+  <div id="filterBackdrop" class="backdrop"></div>
+  <aside id="detailDrawer" class="detail-drawer" aria-hidden="true">
+    <button id="closeDrawer" class="drawer-close" aria-label="关闭">×</button>
+    <div id="drawerContent"></div>
+  </aside>
+  <aside id="accountDrawer" class="account-drawer" aria-hidden="true" aria-labelledby="accountDrawerTitle">
+    <button id="closeAccount" class="drawer-close" aria-label="关闭账号中心">×</button>
+    <section id="loginPanel" class="login-panel">
+      <p class="eyebrow">PRIVATE WATCH DESK</p>
+      <h2 id="accountDrawerTitle">登录账号</h2>
+      <p>登录后可以关注游戏、筛选关注列表并下载产品信息。</p>
+      <form id="loginForm" class="account-form">
+        <label><span>登录账号</span><input id="loginUsername" name="username" autocomplete="username" required minlength="3"></label>
+        <label><span>密码</span><input id="loginPassword" name="password" type="password" autocomplete="current-password" required minlength="8"></label>
+        <p id="loginMessage" class="form-message" role="status"></p>
+        <button class="account-primary" type="submit">进入新游雷达</button>
+      </form>
+    </section>
+    <section id="accountCenter" class="account-center" hidden>
+      <header class="account-identity">
+        <span id="profileAvatar" class="profile-avatar">G</span>
+        <div><p class="eyebrow">SIGNED IN</p><h2 id="profileDisplayName">—</h2><p><span id="profileUsername">—</span> · <b id="profileRole">—</b></p></div>
+      </header>
+      <nav class="account-tabs" aria-label="账号中心功能">
+        <button class="active" data-account-tab="profile" type="button">个人中心</button>
+        <button data-account-tab="api" type="button">API 接口</button>
+        <button id="usersTabButton" data-account-tab="users" type="button" hidden>账号管理</button>
+      </nav>
+      <section id="profileTab" class="account-tab active">
+        <div class="account-section-head"><div><span>PROFILE</span><h3>个人资料</h3></div><button id="logoutButton" class="text-btn danger" type="button">退出登录</button></div>
+        <form id="profileForm" class="account-form">
+          <label><span>显示名</span><input id="profileDisplayInput" maxlength="40" required></label>
+          <div class="password-change">
+            <p>修改密码 <small>不修改时请留空</small></p>
+            <label><span>当前密码</span><input id="currentPassword" type="password" autocomplete="current-password"></label>
+            <label><span>新密码</span><input id="newPassword" type="password" autocomplete="new-password" minlength="8"></label>
+            <label><span>确认新密码</span><input id="confirmPassword" type="password" autocomplete="new-password" minlength="8"></label>
+          </div>
+          <p id="profileMessage" class="form-message" role="status"></p>
+          <button class="account-primary" type="submit">保存个人资料</button>
+        </form>
+      </section>
+      <section id="apiTab" class="account-tab">
+        <div class="account-section-head"><div><span>DEVELOPER ACCESS</span><h3>API Key</h3></div><small>密钥仅在创建时显示一次</small></div>
+        <div class="api-guide">
+          <span>GET</span>
+          <code id="apiEndpoint">api/v1/favorites</code>
+          <p>请求头：<code>Authorization: Bearer &lt;API_KEY&gt;</code></p>
+        </div>
+        <form id="createApiKeyForm" class="api-key-create">
+          <label><span>密钥名称</span><input id="apiKeyName" value="关注产品同步" maxlength="40" required></label>
+          <button class="account-primary" type="submit">生成 API Key</button>
+        </form>
+        <p id="apiKeyMessage" class="form-message" role="status"></p>
+        <div id="generatedApiKey" class="generated-key" hidden>
+          <span>请立即复制保存</span>
+          <code id="generatedApiKeyValue"></code>
+          <button id="copyApiKey" type="button">复制密钥</button>
+        </div>
+        <div class="api-key-list-head"><strong>有效密钥</strong><small>最多 10 个</small></div>
+        <div id="apiKeyList" class="api-key-list" aria-live="polite"></div>
+      </section>
+      <section id="usersTab" class="account-tab">
+        <div class="account-section-head"><div><span>ACCESS CONTROL</span><h3>账号管理</h3></div><small id="userScopeNote">—</small></div>
+        <details class="create-user-panel">
+          <summary>新增账号 <i>＋</i></summary>
+          <form id="createUserForm" class="account-form compact-form">
+            <div class="form-grid"><label><span>登录账号</span><input id="newUsername" required minlength="3"></label><label><span>显示名</span><input id="newDisplayName" required maxlength="40"></label></div>
+            <div class="form-grid"><label><span>初始密码</span><input id="newUserPassword" type="password" required minlength="8"></label><label id="newRoleLabel"><span>角色</span><select id="newUserRole"><option value="user">普通用户</option><option value="admin">管理员</option><option value="superadmin">超级管理员</option></select></label></div>
+            <p id="createUserMessage" class="form-message" role="status"></p>
+            <button class="account-primary" type="submit">创建账号</button>
+          </form>
+        </details>
+        <div id="userList" class="user-list" aria-live="polite"></div>
+      </section>
+    </section>
+  </aside>
+  <div id="imageLightbox" class="image-lightbox" role="dialog" aria-modal="true" aria-labelledby="lightboxTitle" hidden>
+    <button id="lightboxClose" class="lightbox-close" type="button" aria-label="关闭大图">×</button>
+    <div class="lightbox-stage">
+      <div class="lightbox-head">
+        <div><span>STORE MEDIA / FULL VIEW</span><strong id="lightboxTitle">图集</strong></div>
+        <p><b id="lightboxCurrent">1</b> / <span id="lightboxTotal">1</span></p>
+      </div>
+      <img id="lightboxImage" class="lightbox-image" src="" alt="">
+      <button id="lightboxPrev" class="lightbox-nav lightbox-prev" type="button" aria-label="上一张"><img src="assets/icons/chevron-left.svg" alt=""></button>
+      <button id="lightboxNext" class="lightbox-nav lightbox-next" type="button" aria-label="下一张"><img src="assets/icons/chevron-right.svg" alt=""></button>
+      <div class="lightbox-foot">
+        <span id="lightboxSource">—</span>
+        <small>键盘 ← → 切换 · Esc 关闭</small>
+        <a id="lightboxOriginal" href="#" target="_blank" rel="noreferrer">查看原图 ↗</a>
+      </div>
+    </div>
+  </div>
+  <script src="assets/app.js?v=20260824-gallery-lightbox" defer></script>
+</body>
+</html>

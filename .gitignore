@@ -1,0 +1,52 @@
+# 本地配置与密钥
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+.ssh/
+
+# 运行数据、抓取证据和用户数据
+data/
+raw/
+runtime/
+logs/
+research/
+apks/
+apk-inspect/
+.playwright-mcp/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.raw
+*.tar
+*.tar.gz
+
+# 本机专用运维脚本与验收记录
+scripts/run_simulator_daily.ps1
+design-qa.md
+模拟器安装清单.md
+采集字段与平台入口实测研究.md
+
+# Python / 测试 / 构建缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
