@@ -326,6 +326,14 @@ def _game_gallery(game: dict) -> list[dict]:
     return gallery
 
 
+def _source_payload(source: str) -> dict:
+    return {
+        "key": source,
+        "label": SOURCE_LABELS.get(source, source),
+        "note": SOURCE_NOTES.get(source),
+    }
+
+
 def _serialize(game: dict, members: Iterable[sqlite3.Row] | None = None) -> dict:
     selected = list(members if members is not None else game["members"])
     sources = sorted(
@@ -375,18 +383,75 @@ def _serialize(game: dict, members: Iterable[sqlite3.Row] | None = None) -> dict
         "last_seen_at": game["last_seen_at"],
         "source_count": len(sources),
         "event_count": len(events),
-        "sources": [
-            {
-                "key": source,
-                "label": SOURCE_LABELS.get(source, source),
-                "note": SOURCE_NOTES.get(source),
-            }
-            for source in sources
-        ],
+        "sources": [_source_payload(source) for source in sources],
         "events": events,
         "featured_event": featured,
         "gallery": _game_gallery(game),
     }
+
+
+def _catalog_entries_for_game(game: dict, members: Iterable[sqlite3.Row], view_mode: str) -> list[dict]:
+    """把渠道原子事件投影为产品聚合或渠道明细列表项。"""
+    scoped = list(members)
+    if view_mode == "channel":
+        entries = []
+        seen = set()
+        for row in scoped:
+            event_date, _ = _event_date(row)
+            event_type = _effective_event_type(row)
+            event_key = (row["source"], event_type, event_date, row["status"])
+            if event_key in seen:
+                continue
+            seen.add(event_key)
+            payload = _serialize(game, [row])
+            payload.update({
+                "view_mode": "channel",
+                "entry_key": f'{game["canonical_key"]}|{row["source"]}|{event_type}|{event_date}',
+                "source_count": 1,
+                "event_sources": [_source_payload(row["source"])],
+                "event_source_count": 1,
+                "channel_event_count": 1,
+                "later_event_count": 0,
+            })
+            entries.append(payload)
+        return entries
+
+    grouped: dict[str, list] = defaultdict(list)
+    for row in scoped:
+        grouped[_effective_event_type(row)].append(row)
+
+    entries = []
+    for event_type, rows in grouped.items():
+        payload = _serialize(game, rows)
+        if not payload["events"]:
+            continue
+        earliest_date = min(event["date"] for event in payload["events"] if event["date"])
+        primary_events = [event for event in payload["events"] if event["date"] == earliest_date]
+        primary_events.sort(
+            key=lambda event: (
+                SOURCE_ORDER.get(event["source"], len(SOURCE_ORDER)),
+                event["source_label"],
+            )
+        )
+        primary_sources = sorted(
+            {event["source"] for event in primary_events},
+            key=lambda source: (SOURCE_ORDER.get(source, len(SOURCE_ORDER)), SOURCE_LABELS.get(source, source)),
+        )
+        featured = dict(primary_events[0])
+        featured["primary_source_count"] = len(primary_sources)
+        scoped_sources = {event["source"] for event in payload["events"]}
+        payload.update({
+            "view_mode": "product",
+            "entry_key": f'{game["canonical_key"]}|{event_type}|{earliest_date}',
+            "featured_event": featured,
+            "source_count": len(scoped_sources),
+            "event_sources": [_source_payload(source) for source in primary_sources],
+            "event_source_count": len(primary_sources),
+            "channel_event_count": len(payload["events"]),
+            "later_event_count": len(payload["events"]) - len(primary_events),
+        })
+        entries.append(payload)
+    return entries
 
 
 _EVENT_ONLY_INTRO = re.compile(
@@ -439,7 +504,7 @@ def _filtered_games(
     date_from: str | None = None, date_to: str | None = None,
     sources: set[str] | None = None, categories: set[str] | None = None,
     developers: set[str] | None = None, event_types: set[str] | None = None,
-    q: str | None = None,
+    q: str | None = None, view_mode: str = "product",
 ) -> list[dict]:
     start, end = _period_range(period, anchor)
     if date_from:
@@ -469,15 +534,17 @@ def _filtered_games(
                 continue
             if event_types and _effective_event_type(row) not in event_types:
                 continue
-            event_day, _ = _event_date(row)
-            event_date = date.fromisoformat(event_day) if event_day else None
-            if start and (not event_date or event_date < start):
-                continue
-            if end and (not event_date or event_date > end):
-                continue
             selected.append(row)
         if selected:
-            result.append(_serialize(game, selected))
+            # 日期筛选必须发生在聚合之后，否则范围起点会被误当作“最早渠道日期”。
+            for entry in _catalog_entries_for_game(game, selected, view_mode):
+                event_day = (entry.get("featured_event") or {}).get("date")
+                event_date = date.fromisoformat(event_day) if event_day else None
+                if start and (not event_date or event_date < start):
+                    continue
+                if end and (not event_date or event_date > end):
+                    continue
+                result.append(entry)
     return result
 
 
@@ -1016,10 +1083,12 @@ def games(
     category: list[str] | None = Query(default=None),
     developer: list[str] | None = Query(default=None),
     event_type: list[str] | None = Query(default=None),
-    q: str | None = None, sort: str = "event_desc",
+    q: str | None = None, sort: str = "event_desc", view: str = "product",
     followed: bool = False,
     page: int = Query(default=1, ge=1), page_size: int = Query(default=24, ge=1, le=100),
 ):
+    if view not in {"product", "channel"}:
+        raise HTTPException(status_code=422, detail="view 仅支持 product/channel")
     context = _session_context(request, required=False)
     if followed and not context:
         raise HTTPException(status_code=401, detail="登录后才能查看已关注列表")
@@ -1027,7 +1096,7 @@ def games(
     favorite_keys = set(favorite_dates)
     items = _filtered_games(
         period, anchor, date_from, date_to, _csv(source), _csv(category),
-        _csv(developer), _csv(event_type), q,
+        _csv(developer), _csv(event_type), q, view,
     )
     if followed:
         items = [item for item in items if item["key"] in favorite_keys]
@@ -1045,8 +1114,12 @@ def games(
             reverse=reverse,
         )
     total = len(items)
+    product_total = len({item["key"] for item in items})
     start = (page - 1) * page_size
-    return {"total": total, "page": page, "page_size": page_size, "items": items[start:start + page_size]}
+    return {
+        "view": view, "total": total, "product_total": product_total,
+        "page": page, "page_size": page_size, "items": items[start:start + page_size],
+    }
 
 
 @app.get("/api/games/{game_id}")
@@ -1068,9 +1141,11 @@ def game_detail(game_id: int, request: Request):
 
 
 @app.get("/api/summary")
-def summary(anchor: str | None = None):
+def summary(anchor: str | None = None, view: str = "product"):
+    if view not in {"product", "channel"}:
+        raise HTTPException(status_code=422, detail="view 仅支持 product/channel")
     current = anchor or date.today().isoformat()
-    periods = {period: _filtered_games(period, current) for period in ("day", "week", "month", "all")}
+    periods = {period: _filtered_games(period, current, view_mode=view) for period in ("day", "week", "month", "all")}
     conn = _conn()
     try:
         last = conn.execute(
@@ -1082,6 +1157,7 @@ def summary(anchor: str | None = None):
         conn.close()
     return {
         "anchor": current,
+        "view": view,
         "today": len(periods["day"]), "week": len(periods["week"]),
         "month": len(periods["month"]), "all": len(periods["all"]),
         "events": event_count, "sources": source_count,
@@ -1123,18 +1199,32 @@ def filters():
 
 
 @app.get("/api/calendar")
-def calendar(start: str | None = None, days: int = Query(default=42, ge=7, le=120)):
+def calendar(
+    start: str | None = None, days: int = Query(default=42, ge=7, le=120),
+    view: str = "product",
+    source: list[str] | None = Query(default=None),
+    category: list[str] | None = Query(default=None),
+    developer: list[str] | None = Query(default=None),
+    event_type: list[str] | None = Query(default=None),
+    q: str | None = None,
+):
+    if view not in {"product", "channel"}:
+        raise HTTPException(status_code=422, detail="view 仅支持 product/channel")
     first = date.fromisoformat(start) if start else date.today() - timedelta(days=7)
     last = first + timedelta(days=days - 1)
-    games = _filtered_games("all", date_from=first.isoformat(), date_to=last.isoformat())
+    games = _filtered_games(
+        "all", date_from=first.isoformat(), date_to=last.isoformat(),
+        sources=_csv(source), categories=_csv(category), developers=_csv(developer),
+        event_types=_csv(event_type), q=q, view_mode=view,
+    )
     counts, event_counts = Counter(), Counter()
     for game in games:
-        for event in game["events"]:
-            if first.isoformat() <= event["date"] <= last.isoformat():
-                counts[event["date"]] += 1
-                event_counts[(event["date"], event["type"])] += 1
+        event = game.get("featured_event")
+        if event and first.isoformat() <= event["date"] <= last.isoformat():
+            counts[event["date"]] += 1
+            event_counts[(event["date"], event["type"])] += 1
     return {
-        "start": first.isoformat(), "end": last.isoformat(),
+        "start": first.isoformat(), "end": last.isoformat(), "view": view,
         "days": [
             {
                 "date": (first + timedelta(days=offset)).isoformat(),

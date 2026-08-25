@@ -6,7 +6,7 @@
   <meta name="description" content="国内游戏分发渠道新游、首发、预约与测试事件聚合看板">
   <title>新游雷达 · Release Radar</title>
   <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="assets/app.css?v=20260824-gallery-lightbox">
+  <link rel="stylesheet" href="assets/app.css?v=20260825-event-dimensions">
 </head>
 <body>
   <a class="skip-link" href="#catalogTitle">跳到新游列表</a>
@@ -35,12 +35,12 @@
       <div class="hero-copy">
         <p class="eyebrow">国内游戏分发渠道 · 上线 / 首发 / 测试 / 预约</p>
         <h1>今天，有什么<br><em>新游戏</em>出现？</h1>
-        <p class="hero-note">同款产品自动合并，保留所有来源证据。日期既包含渠道公布的事件日，也标记首次采集发现日。</p>
+        <p class="hero-note" id="heroDimensionNote">同款产品按事件类型聚合，只在全渠道最早日期出现；详情仍保留所有来源证据。</p>
       </div>
       <div class="metric-board" aria-label="新游统计">
-        <button class="metric primary" data-period="day"><span>今日</span><strong id="metricToday">—</strong><small>个产品事件</small></button>
-        <button class="metric" data-period="week"><span>本周</span><strong id="metricWeek">—</strong><small>自然周</small></button>
-        <button class="metric" data-period="month"><span>本月</span><strong id="metricMonth">—</strong><small>自然月</small></button>
+        <button class="metric primary" data-period="day"><span>今日</span><strong id="metricToday">—</strong><small id="metricTodayUnit">个产品事件</small></button>
+        <button class="metric" data-period="week"><span>本周</span><strong id="metricWeek">—</strong><small id="metricWeekUnit">产品聚合口径</small></button>
+        <button class="metric" data-period="month"><span>本月</span><strong id="metricMonth">—</strong><small id="metricMonthUnit">产品聚合口径</small></button>
         <button class="metric" data-period="all"><span>产品库</span><strong id="metricAll">—</strong><small id="metricSources">— 个渠道</small></button>
       </div>
     </section>
@@ -115,6 +115,17 @@
       </aside>
 
       <div class="catalog">
+        <section class="dimension-desk" aria-labelledby="dimensionTitle">
+          <div class="dimension-copy">
+            <span>DATA GRAIN</span>
+            <h2 id="dimensionTitle">查看维度</h2>
+            <p id="dimensionHint">同一产品的同类事件只保留全渠道最早日期；来源筛选会重新计算最早日期。</p>
+          </div>
+          <div class="dimension-switch" role="group" aria-label="数据查看维度">
+            <button id="productDimension" class="active" type="button" data-dimension="product" aria-pressed="true"><b>产品聚合</b><small>去除跨渠道重复</small></button>
+            <button id="channelDimension" type="button" data-dimension="channel" aria-pressed="false"><b>渠道明细</b><small>逐条查看渠道事件</small></button>
+          </div>
+        </section>
         <div class="catalog-toolbar">
           <div>
             <p class="eyebrow">LIVE CATALOG</p>
@@ -243,6 +254,6 @@
       </div>
     </div>
   </div>
-  <script src="assets/app.js?v=20260824-gallery-lightbox" defer></script>
+  <script src="assets/app.js?v=20260825-event-dimensions" defer></script>
 </body>
 </html>

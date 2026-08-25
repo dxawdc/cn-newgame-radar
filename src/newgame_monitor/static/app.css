@@ -164,6 +164,23 @@ select { width: 100%; height: 40px; padding: 0 30px 0 10px; border: 1px solid va
 .scope-note i { width: 8px; height: 8px; border-radius: 50%; background: var(--acid); border: 1px solid var(--ink); flex: none; margin-top: 4px; }
 .scope-note p { margin: 0; }
 .catalog { min-width: 0; }
+.dimension-desk { display: flex; justify-content: space-between; align-items: stretch; gap: 24px; margin: 0 0 32px; padding: 14px; border: 1px solid var(--ink); background: #faf9f4; box-shadow: 5px 5px 0 var(--paper-deep); }
+.dimension-copy { min-width: 0; padding: 5px 4px; }
+.dimension-copy > span { display: block; color: var(--signal); font-size: 8px; font-weight: 900; letter-spacing: .18em; }
+.dimension-copy h2 { margin: 4px 0 6px; font: 800 19px/1 var(--display); }
+.dimension-copy p { max-width: 580px; margin: 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.dimension-switch { display: grid; grid-template-columns: repeat(2, minmax(150px, 1fr)); border: 1px solid var(--ink); background: var(--ink); gap: 1px; flex: 0 0 360px; }
+.dimension-switch button { min-height: 62px; border: 0; background: var(--paper); padding: 10px 14px; text-align: left; cursor: pointer; transition: background .18s, color .18s, transform .18s; }
+.dimension-switch button:hover { background: white; }
+.dimension-switch button.active { background: var(--ink); color: white; }
+.dimension-switch button[aria-pressed="false"] { background: var(--paper); color: var(--ink); }
+.dimension-switch button[aria-pressed="true"] { background: var(--ink); color: white; }
+.dimension-switch button b, .dimension-switch button small { display: block; }
+.dimension-switch button b { font-size: 12px; letter-spacing: .04em; }
+.dimension-switch button small { margin-top: 6px; color: var(--muted); font-size: 8px; }
+.dimension-switch button.active small { color: var(--acid); }
+.dimension-switch button[aria-pressed="false"] small { color: var(--muted); }
+.dimension-switch button[aria-pressed="true"] small { color: var(--acid); }
 .catalog-toolbar { display: flex; justify-content: space-between; gap: 28px; align-items: end; margin-bottom: 23px; }
 .catalog-toolbar h2 { margin: 0; font: 800 40px/1.1 var(--display); }
 .catalog-toolbar #resultMeta { margin: 9px 0 0; color: var(--muted); font-size: 12px; }
@@ -195,17 +212,22 @@ select { width: 100%; height: 40px; padding: 0 30px 0 10px; border: 1px solid va
 .game-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; }
 .meta-tag { font-size: 9px; border: 1px solid var(--line); padding: 4px 7px; }
 .source-row { border-top: 1px solid var(--line); margin-top: 18px; padding-top: 13px; display: flex; gap: 5px; flex-wrap: wrap; }
+.source-context { flex: 0 0 100%; margin-bottom: 3px; color: var(--muted); font-size: 8px; font-weight: 800; letter-spacing: .08em; }
 .source-tag { background: var(--blue); color: white; padding: 4px 7px; font-size: 9px; font-weight: 700; }
 .source-tag:nth-child(2n) { background: var(--ink); }
 .source-tag.source-incomplete { order: 99; display: inline-flex; align-items: center; gap: 5px; background: #6f6c64; }
 .source-tag.source-incomplete small { border-left: 1px solid rgba(255,255,255,.45); padding-left: 5px; font-size: 7px; font-weight: 800; }
 .source-more { background: var(--signal); }
 .follow-date { margin: 9px 0 -5px; color: var(--muted); font-size: 9px; font-variant-numeric: tabular-nums; }
+.later-events { margin: 9px 0 -3px; color: var(--muted); font-size: 9px; line-height: 1.45; }
+.later-events strong { color: var(--signal); }
 .follow-date time { color: var(--ink); font-weight: 800; }
 .game-grid.list-view { grid-template-columns: 1fr; gap: 9px; }
 .game-grid.list-view .game-card { min-height: 150px; display: grid; grid-template-columns: minmax(320px, .8fr) 1fr 230px; gap: 24px; align-items: center; }
 .game-grid.list-view .game-intro { margin: 0; }
 .game-grid.list-view .source-row { margin: 0; border: 0; padding: 0; justify-content: end; }
+.game-grid.list-view .source-context { text-align: right; }
+.game-grid.list-view .later-events { display: none; }
 .empty-state { text-align: center; padding: 100px 20px; border: 1px dashed var(--line); }
 .empty-state span { font: 800 70px/1 var(--display); color: var(--signal); }
 .empty-state h3 { font: 800 25px/1 var(--display); margin: 15px 0 5px; }
@@ -408,6 +430,8 @@ footer p { margin: 0; font-weight: 500; letter-spacing: 0; }
   .calendar-nav button { flex: 1; }
   .calendar-day { min-height: 92px; padding: 11px 9px; }
   .catalog-section { display: block; padding-top: 38px; }
+  .dimension-desk { margin-bottom: 26px; }
+  .dimension-switch { flex-basis: 330px; }
   .filters { position: fixed; z-index: 70; background: var(--paper); inset: 0 8% 0 0; padding: 30px 22px 60px; overflow-y: auto; transform: translateX(-105%); transition: transform .25s; }
   .filters.open { transform: translateX(0); }
   .mobile-filter { display: block; border: 1px solid var(--ink); background: transparent; height: 40px; }
@@ -425,6 +449,9 @@ footer p { margin: 0; font-weight: 500; letter-spacing: 0; }
   #lastUpdated { display: none; }
   .mast-meta { width: auto; }
   .date-range-controls { grid-template-columns: minmax(0,1fr) auto minmax(0,1fr); }
+  .dimension-desk { display: grid; gap: 14px; margin-left: -18px; margin-right: -18px; padding: 18px; border-left: 0; border-right: 0; box-shadow: 0 5px 0 var(--paper-deep); }
+  .dimension-switch { width: 100%; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dimension-switch button { min-height: 58px; padding: 9px 11px; }
   .date-primary { grid-column: 1 / 3; }
   .date-secondary { grid-column: 3; }
   .calendar-details summary { grid-template-columns: minmax(0,1fr) auto; gap: 8px 14px; }

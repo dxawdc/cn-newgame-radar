@@ -19,12 +19,14 @@ const startOfWeek = (value) => {
   return date;
 };
 const todayKey = () => dateKey(new Date());
+const initialQuery = new URLSearchParams(location.search);
 
 const state = {
   period: 'day', anchor: todayKey(), page: 1, pageSize: 24,
   sources: new Set(), events: new Set(), category: '', developer: '', q: '',
   dateFrom: '', dateTo: '', sort: 'event_desc', view: 'grid', total: 0, filters: null,
   followed: false, currentDetailId: null,
+  dimension: initialQuery.get('view') === 'channel' ? 'channel' : 'product',
   auth: {user: null, csrfToken: '', favoriteCount: 0, permissions: {manage_users:false, manage_admins:false}},
   calendarStart: dateKey(startOfWeek(addDays(new Date(), -7))),
   galleryResizeObserver: null,
@@ -68,7 +70,7 @@ async function api(path, params = {}, options = {}) {
 }
 
 async function loadSummary() {
-  const data = await api('/api/summary', {anchor: state.anchor});
+  const data = await api('/api/summary', {anchor: state.anchor, view: state.dimension});
   $('#metricToday').textContent = data.today;
   $('#metricWeek').textContent = data.week;
   $('#metricMonth').textContent = data.month;
@@ -81,7 +83,11 @@ async function loadSummary() {
 }
 
 async function loadCalendar() {
-  const data = await api('/api/calendar', {start: state.calendarStart, days: 28});
+  const data = await api('/api/calendar', {
+    start: state.calendarStart, days: 28, view: state.dimension,
+    source: [...state.sources], event_type: [...state.events],
+    category: state.category, developer: state.developer, q: state.q,
+  });
   const weekdays = ['日','一','二','三','四','五','六'];
   const firstDay = data.days[0]?.date || state.calendarStart;
   const lastDay = data.days.at(-1)?.date || dateKey(addDays(state.calendarStart, 27));
@@ -94,9 +100,10 @@ async function loadCalendar() {
     const inRange = Boolean(state.dateFrom && state.dateTo && day.date > state.dateFrom && day.date < state.dateTo);
     const isPeriodDay = !state.dateFrom && !state.dateTo && state.period === 'day' && day.date === state.anchor;
     const classes = [day.count ? 'has-events' : '', isToday ? 'today' : '', rangeStart ? 'range-start' : '', rangeEnd ? 'range-end' : '', inRange ? 'in-range' : '', isPeriodDay ? 'active' : ''].filter(Boolean).join(' ');
-    return `<button class="calendar-day ${classes}" data-date="${day.date}" aria-label="${day.date}，${day.count || 0} 个事件" aria-pressed="${rangeStart || rangeEnd || inRange || isPeriodDay}">
+    const countUnit = state.dimension === 'product' ? '个产品事件' : '条渠道事件';
+    return `<button class="calendar-day ${classes}" data-date="${day.date}" aria-label="${day.date}，${day.count || 0} ${countUnit}" aria-pressed="${rangeStart || rangeEnd || inRange || isPeriodDay}">
       <span class="weekday">周${weekdays[d.getDay()]}</span><span class="day-number">${String(d.getDate()).padStart(2,'0')}</span>
-      <span class="event-num"><strong>${day.count || 0}</strong><em> 个事件</em></span></button>`;
+      <span class="event-num"><strong>${day.count || 0}</strong><em> ${countUnit}</em></span></button>`;
   }).join('');
   $$('.calendar-day').forEach(button => button.addEventListener('click', () => selectCalendarDate(button.dataset.date)));
 }
@@ -110,11 +117,11 @@ async function loadFilters() {
   $$('.filter-chip').forEach(button => button.addEventListener('click', () => {
     const value = button.dataset.event;
     state.events.has(value) ? state.events.delete(value) : state.events.add(value);
-    button.classList.toggle('active'); state.page = 1; loadGames(); updateFilterPills();
+    button.classList.toggle('active'); state.page = 1; loadCalendar(); loadGames(); updateFilterPills();
   }));
   $$('.source-check input').forEach(input => input.addEventListener('change', () => {
     input.checked ? state.sources.add(input.value) : state.sources.delete(input.value);
-    state.page = 1; loadGames(); updateFilterPills();
+    state.page = 1; loadCalendar(); loadGames(); updateFilterPills();
   }));
 }
 
@@ -123,10 +130,16 @@ function gameCard(game, index) {
   const icon = game.icon_url
     ? `<img class="game-icon" src="${escapeHTML(game.icon_url)}" alt="${escapeHTML(game.name)} 图标" loading="lazy" onerror="this.outerHTML='<span class=&quot;icon-fallback&quot;>${escapeHTML(game.name.slice(0,1))}</span>'">`
     : `<span class="icon-fallback">${escapeHTML(game.name.slice(0,1))}</span>`;
-  const sources = game.sources.slice(0, 3).map(sourceTag).join('');
-  const more = game.sources.length > 3 ? `<span class="source-tag source-more">+${game.sources.length-3}</span>` : '';
+  const eventSources = game.event_sources || game.sources || [];
+  const sources = eventSources.slice(0, 3).map(sourceTag).join('');
+  const more = eventSources.length > 3 ? `<span class="source-tag source-more">+${eventSources.length-3}</span>` : '';
   const tags = [game.category, event.type_label, ...(game.tags || [])].filter(Boolean).filter((x,i,a)=>a.indexOf(x)===i).slice(0,4);
-  const dateNote = event.date_precision === 'discovered' ? '首次发现' : (event.type_label || '新游事件');
+  const dateNote = state.dimension === 'product'
+    ? (event.date_precision === 'discovered' ? '最早首次发现' : `最早渠道${event.type_label || '事件'}`)
+    : (event.date_precision === 'discovered' ? '首次发现' : (event.type_label || '渠道事件'));
+  const sourceContext = state.dimension === 'product' ? '最早发生渠道' : '事件来源';
+  const laterEvents = state.dimension === 'product' && game.later_event_count
+    ? `<p class="later-events">后续还有 <strong>${game.later_event_count}</strong> 个同类渠道事件，完整轨迹见详情</p>` : '';
   const followLabel = game.followed ? '已关注' : '＋ 关注';
   return `<article class="game-card" data-id="${game.id}" data-key="${escapeHTML(game.key)}" data-index="${String(index+1).padStart(2,'0')}">
     <button class="card-follow ${game.followed ? 'active' : ''}" type="button" data-follow-key="${escapeHTML(game.key)}" aria-pressed="${Boolean(game.followed)}">${followLabel}</button>
@@ -134,7 +147,8 @@ function gameCard(game, index) {
     <h3>${escapeHTML(game.name)}</h3><p class="developer">${escapeHTML(game.developer || '开发商待补充')}</p></div></div>
     <p class="game-intro">${escapeHTML(game.intro || '该渠道暂未提供玩法介绍，已保留来源事件等待详情补全。')}</p>
     <div class="game-meta">${tags.map(tag => `<span class="meta-tag">${escapeHTML(tag)}</span>`).join('')}</div>
-    <div class="source-row">${sources}${more}</div>
+    <div class="source-row"><span class="source-context">${sourceContext}</span>${sources}${more}</div>
+    ${laterEvents}
     <p class="follow-date" ${game.followed && game.last_followed_at ? '' : 'hidden'}>最近关注 <time>${escapeHTML(fmtFollowTime(game.last_followed_at))}</time></p></article>`;
 }
 
@@ -146,13 +160,15 @@ async function loadGames() {
       date_from: state.dateFrom, date_to: state.dateTo, source: [...state.sources],
       event_type: [...state.events], category: state.category, developer: state.developer,
       q: state.q, sort: state.sort, page: state.page, page_size: state.pageSize,
-      followed: state.followed,
+      followed: state.followed, view: state.dimension,
     };
     const data = await api('/api/games', params); state.total = data.total;
     $('#gameGrid').innerHTML = data.items.map(gameCard).join('');
     $('#gameGrid').classList.toggle('list-view', state.view === 'list');
     $('#emptyState').hidden = data.total !== 0;
-    $('#resultMeta').textContent = `命中 ${data.total} 款独立产品 · 第 ${data.page} 页`;
+    $('#resultMeta').textContent = state.dimension === 'product'
+      ? `命中 ${data.total} 个产品事件 · 涉及 ${data.product_total} 款独立产品 · 第 ${data.page} 页`
+      : `命中 ${data.total} 条渠道事件 · 涉及 ${data.product_total} 款独立产品 · 第 ${data.page} 页`;
     const pages = Math.max(1, Math.ceil(data.total / state.pageSize));
     $('#pageInfo').textContent = `${state.page} / ${pages}`;
     $('#prevPage').disabled = state.page <= 1; $('#nextPage').disabled = state.page >= pages;
@@ -575,6 +591,41 @@ function normalizedRange(from, to) {
   return [from, to];
 }
 
+function updateDimensionUI() {
+  const productMode = state.dimension === 'product';
+  $$('.dimension-switch button').forEach(button => {
+    const active = button.dataset.dimension === state.dimension;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
+  $('#dimensionHint').textContent = productMode
+    ? '同一产品的同类事件只保留当前渠道范围内的最早日期；来源筛选会重新计算最早日期。'
+    : '每个渠道事件独立展示；同一产品可在不同渠道、不同日期重复出现。';
+  $('#heroDimensionNote').textContent = productMode
+    ? '同款产品按事件类型聚合，只在当前渠道范围内的最早日期出现；详情仍保留所有来源证据。'
+    : '按渠道逐条查看原始事件，同款产品在不同渠道或日期可重复出现。';
+  const metricUnit = productMode ? '产品聚合口径' : '渠道事件口径';
+  $('#metricTodayUnit').textContent = productMode ? '个产品事件' : '条渠道事件';
+  $('#metricWeekUnit').textContent = metricUnit;
+  $('#metricMonthUnit').textContent = metricUnit;
+  $('#emptyState').querySelector('p').textContent = productMode
+    ? '试试放宽日期、渠道或事件类型；产品聚合只落在同类事件的最早日期。'
+    : '试试放宽日期、渠道或事件类型。';
+}
+
+function setDimension(dimension) {
+  if (!['product', 'channel'].includes(dimension) || dimension === state.dimension) return;
+  state.dimension = dimension;
+  state.page = 1;
+  const url = new URL(location.href);
+  url.searchParams.set('view', dimension);
+  history.replaceState(null, '', url);
+  updateDimensionUI();
+  loadSummary();
+  loadCalendar();
+  loadGames();
+}
+
 function updateDateWorkbench() {
   const hasRange = Boolean(state.dateFrom || state.dateTo);
   $('#dateFrom').value = state.dateFrom;
@@ -691,9 +742,9 @@ function bindUI() {
     updateDateWorkbench(); updatePeriodUI(); updateFilterPills(); loadCalendar(); loadGames();
   }));
   let searchTimer;
-  $('#searchInput').addEventListener('input', event => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { state.q = event.target.value.trim(); state.page = 1; updateFilterPills(); loadGames(); }, 260); });
-  $('#categorySelect').addEventListener('change', e => { state.category = e.target.value; state.page = 1; updateFilterPills(); loadGames(); });
-  $('#developerSelect').addEventListener('change', e => { state.developer = e.target.value; state.page = 1; updateFilterPills(); loadGames(); });
+  $('#searchInput').addEventListener('input', event => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { state.q = event.target.value.trim(); state.page = 1; updateFilterPills(); loadCalendar(); loadGames(); }, 260); });
+  $('#categorySelect').addEventListener('change', e => { state.category = e.target.value; state.page = 1; updateFilterPills(); loadCalendar(); loadGames(); });
+  $('#developerSelect').addEventListener('change', e => { state.developer = e.target.value; state.page = 1; updateFilterPills(); loadCalendar(); loadGames(); });
   $('#dateFrom').addEventListener('change', e => { state.dateFrom = e.target.value; applyDateState({reframe:true}); });
   $('#dateTo').addEventListener('change', e => { state.dateTo = e.target.value; applyDateState({reframe:true}); });
   $('#applyDateRange').addEventListener('click', () => {
@@ -709,6 +760,7 @@ function bindUI() {
   $('#nextCalendar').addEventListener('click', () => { state.calendarStart = dateKey(addDays(state.calendarStart, 28)); loadCalendar(); });
   $('#todayCalendar').addEventListener('click', () => { state.calendarStart = dateKey(startOfWeek(addDays(new Date(), -7))); loadCalendar(); });
   $('#sortSelect').addEventListener('change', e => { state.sort = e.target.value; loadGames(); });
+  $$('.dimension-switch button').forEach(button => button.addEventListener('click', () => setDimension(button.dataset.dimension)));
   $('#clearFilters').addEventListener('click', resetFilters);
   $('#prevPage').addEventListener('click', () => { if (state.page > 1) { state.page--; loadGames(); scrollTo({top: $('.catalog-section').offsetTop, behavior:'smooth'}); } });
   $('#nextPage').addEventListener('click', () => { state.page++; loadGames(); scrollTo({top: $('.catalog-section').offsetTop, behavior:'smooth'}); });
@@ -828,7 +880,7 @@ function bindUI() {
 }
 
 async function boot() {
-  bindUI(); updateDateWorkbench(); updatePeriodUI();
+  bindUI(); updateDimensionUI(); updateDateWorkbench(); updatePeriodUI();
   await Promise.all([loadAuth(), loadFilters(), loadSummary(), loadCalendar()]);
   updateFilterPills(); await loadGames();
 }

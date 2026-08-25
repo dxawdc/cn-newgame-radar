@@ -1,5 +1,10 @@
+import tempfile
 import unittest
+from pathlib import Path
 
+from newgame_monitor import webapp
+from newgame_monitor.catalog import rebuild_catalog
+from newgame_monitor.db import connect, upsert_items
 from newgame_monitor.webapp import _effective_event_type, _latest_game_intro, _serialize
 from newgame_monitor.enrichment import _find_taptap_detail_content
 
@@ -152,6 +157,77 @@ class WebAppTest(unittest.TestCase):
         result = _latest_game_intro(game)
         self.assertEqual(result["kind"], "full")
         self.assertEqual(result["source_label"], "华为游戏中心")
+
+
+class CatalogDimensionTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.original_db = webapp.DB_PATH
+        webapp.DB_PATH = Path(self.temporary.name) / "dimensions.db"
+        conn = connect(webapp.DB_PATH)
+        common = {
+            "name": "双维度样例游戏", "developer": "样例工作室",
+            "category": "策略", "gameplay_intro": "验证渠道与产品粒度。", "raw": {},
+        }
+        rows = [
+            {**common, "source": "taptap", "source_item_id": "tap-1", "event_type": "launch", "event_time": "2026-08-23", "status": "上线"},
+            {**common, "source": "xiaomi_gamecenter", "source_item_id": "mi-1", "event_type": "launch", "event_time": "2026-08-23", "status": "首发"},
+            {**common, "source": "haoyou_kuaibao", "source_item_id": "hy-1", "event_type": "launch", "event_time": "2026-08-24", "status": "上线"},
+            {**common, "source": "233_leyuan", "source_item_id": "233-1", "event_type": "beta", "event_time": "2026-08-22", "status": "测试"},
+            {**common, "source": "uc_9game", "source_item_id": "uc-1", "event_type": "launch", "event_time": "", "status": "首次采集"},
+        ]
+        upsert_items(conn, rows, "2026-08-25T06:00:00+08:00")
+        rebuild_catalog(conn)
+        conn.close()
+
+    def tearDown(self):
+        webapp.DB_PATH = self.original_db
+        self.temporary.cleanup()
+
+    def test_product_view_uses_earliest_date_and_merges_same_day_channels(self):
+        items = webapp._filtered_games("all", view_mode="product")
+        launch = next(item for item in items if item["featured_event"]["type"] == "launch")
+        self.assertEqual(launch["featured_event"]["date"], "2026-08-23")
+        self.assertEqual(
+            [source["key"] for source in launch["event_sources"]],
+            ["taptap", "xiaomi_gamecenter"],
+        )
+        self.assertEqual(launch["later_event_count"], 1)
+
+    def test_channel_view_keeps_each_source_event(self):
+        items = webapp._filtered_games("all", view_mode="channel")
+        launch_dates = sorted(
+            item["featured_event"]["date"]
+            for item in items
+            if item["featured_event"]["type"] == "launch"
+        )
+        self.assertEqual(launch_dates, ["2026-08-23", "2026-08-23", "2026-08-24"])
+
+    def test_source_scope_recalculates_product_earliest_date(self):
+        items = webapp._filtered_games(
+            "all", sources={"haoyou_kuaibao"}, view_mode="product"
+        )
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["featured_event"]["date"], "2026-08-24")
+
+    def test_date_filter_runs_after_product_aggregation(self):
+        items = webapp._filtered_games(
+            "all", date_from="2026-08-24", date_to="2026-08-24",
+            event_types={"launch"}, view_mode="product",
+        )
+        self.assertEqual(items, [])
+        scoped = webapp._filtered_games(
+            "all", date_from="2026-08-24", date_to="2026-08-24",
+            sources={"haoyou_kuaibao"}, event_types={"launch"}, view_mode="product",
+        )
+        self.assertEqual(len(scoped), 1)
+
+    def test_different_event_types_and_first_seen_remain_separate(self):
+        items = webapp._filtered_games("all", view_mode="product")
+        by_type = {item["featured_event"]["type"]: item for item in items}
+        self.assertEqual(set(by_type), {"beta", "launch", "first_seen"})
+        self.assertEqual(by_type["beta"]["featured_event"]["date"], "2026-08-22")
+        self.assertEqual(by_type["first_seen"]["featured_event"]["date"], "2026-08-25")
 
 
 if __name__ == "__main__":
