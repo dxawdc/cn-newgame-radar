@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +7,7 @@ from newgame_monitor.db import connect, upsert_items
 from newgame_monitor.event_quality import (
     classify_haoyou_event,
     prune_legacy_haoyou_timeline,
+    repair_233_launch_dates,
 )
 
 
@@ -59,6 +61,50 @@ class EventQualityTest(unittest.TestCase):
             rows = conn.execute("SELECT name,event_type,status FROM source_items").fetchall()
             self.assertEqual([(row["name"], row["event_type"]) for row in rows], [("样例新游", "launch")])
             self.assertEqual(rows[0]["status"], "10:00 正式上线")
+            conn.close()
+
+    def test_233_launch_date_uses_detail_online_time_and_merges_duplicate(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conn = connect(Path(folder) / "test.db")
+            detail = {"onlineTime": "2026-08-21 09:00:00", "appName": "诡秘之主"}
+            upsert_items(conn, [{
+                "source": "233_leyuan", "source_item_id": "1503016",
+                "name": "诡秘之主", "event_type": "launch", "event_time": "2026-08-21",
+                "status": "旧上线卡片", "raw": {"banner": {"id": 1}, "detail": detail},
+            }], "2026-08-22T06:00:00+08:00")
+            upsert_items(conn, [{
+                "source": "233_leyuan", "source_item_id": "1503016",
+                "name": "诡秘之主", "event_type": "launch", "event_time": "2026-08-24",
+                "status": "下载送乐币", "raw": {"banner": {"id": 2}, "detail": detail},
+            }], "2026-08-25T06:00:00+08:00")
+
+            result = repair_233_launch_dates(conn)
+
+            self.assertEqual(result, {"checked": 2, "corrected": 0, "duplicates": 1})
+            rows = conn.execute(
+                "SELECT event_time,status,last_seen_at,raw_json FROM source_items"
+            ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["event_time"], "2026-08-21")
+            self.assertEqual(rows[0]["status"], "下载送乐币")
+            self.assertEqual(rows[0]["last_seen_at"], "2026-08-25T06:00:00+08:00")
+            self.assertEqual(json.loads(rows[0]["raw_json"])["banner"]["id"], 2)
+            conn.close()
+
+    def test_233_launch_date_ignores_distant_original_online_time(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conn = connect(Path(folder) / "test.db")
+            upsert_items(conn, [{
+                "source": "233_leyuan", "source_item_id": "old-game",
+                "name": "老游戏", "event_type": "launch", "event_time": "2026-08-24",
+                "raw": {"detail": {"onlineTime": "2023-11-03 10:00:00"}},
+            }], "2026-08-25T06:00:00+08:00")
+
+            result = repair_233_launch_dates(conn)
+
+            self.assertEqual(result, {"checked": 1, "corrected": 0, "duplicates": 0})
+            event_time = conn.execute("SELECT event_time FROM source_items").fetchone()[0]
+            self.assertEqual(event_time, "2026-08-24")
             conn.close()
 
 

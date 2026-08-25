@@ -872,6 +872,9 @@ def _find_233_detail(value, game_id: str) -> dict | None:
 
 
 def _parse_233_event_date(text: str, fallback_ms: int | None) -> str:
+    full = re.search(r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})", text)
+    if full:
+        return date(*map(int, full.groups())).isoformat()
     match = re.search(r"(?:(20\d{2})年)?(\d{1,2})月(\d{1,2})日", text)
     if match:
         now = datetime.now().astimezone()
@@ -883,6 +886,27 @@ def _parse_233_event_date(text: str, fallback_ms: int | None) -> str:
     if fallback_ms:
         return datetime.fromtimestamp(fallback_ms / 1000).astimezone().date().isoformat()
     return ""
+
+
+def _resolve_233_event_date(
+    event_type: str, signal: str, banner: dict, detail: dict,
+) -> str:
+    """按业务时间优先级解析 233 事件日期。
+
+    首页 Banner 的 ``effectiveTimeBegin`` 是运营素材投放时间，会随活动换图而变化；
+    首发必须优先使用游戏详情的 ``onlineTime``，不能把投放日当上线日。
+    """
+    fallback = _parse_233_event_date(signal, banner.get("effectiveTimeBegin"))
+    if event_type == "launch":
+        online_time = str(detail.get("onlineTime") or "")
+        parsed = _parse_233_event_date(online_time, None)
+        if parsed and fallback:
+            distance = abs((date.fromisoformat(parsed) - date.fromisoformat(fallback)).days)
+            if distance <= 90:
+                return parsed
+        elif parsed and abs((date.fromisoformat(parsed) - datetime.now().astimezone().date()).days) <= 90:
+            return parsed
+    return fallback
 
 
 def collect_233() -> tuple[list[dict], list[tuple[str, bytes]]]:
@@ -943,7 +967,7 @@ def collect_233() -> tuple[list[dict], list[tuple[str, bytes]]]:
                 tags.append(str(value))
         intro = detail.get("briefIntro") or detail.get("shortDescription") or config.get("content")
         full_description = detail.get("description") or detail.get("shortDescription")
-        event_time = _parse_233_event_date(signal, banner.get("effectiveTimeBegin"))
+        event_time = _resolve_233_event_date(event_type, signal, banner, detail)
         items.append({
             "source": "233_leyuan",
             "source_item_id": game_id,

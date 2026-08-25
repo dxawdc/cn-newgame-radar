@@ -24,7 +24,7 @@ from .enrichment import (
     enrich_vivo_public_details,
     enrich_xiaomi_public_details,
 )
-from .event_quality import prune_legacy_haoyou_timeline
+from .event_quality import prune_legacy_haoyou_timeline, repair_233_launch_dates
 
 
 def main() -> int:
@@ -81,6 +81,7 @@ def main() -> int:
             conn.commit()
             summary[source] = {"status": "failed", "error": str(exc)}
     summary["quality"] = {"status": "success", **prune_legacy_haoyou_timeline(conn)}
+    summary["233_event_dates"] = {"status": "success", **repair_233_launch_dates(conn)}
     summary["enrichment"] = {"status": "success", **enrich_missing_4399(conn)}
     summary["descriptions"] = {"status": "success", **backfill_full_descriptions(conn)}
     summary["taptap_details"] = {"status": "success", **enrich_taptap_descriptions(conn)}

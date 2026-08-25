@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from datetime import date
 
 
 _SERVICE_VARIANT_NAME = re.compile(
@@ -35,6 +36,106 @@ _OPERATIONAL_RELEASE = re.compile(
     r"[^，。；]{0,18}(?:上线|开放|开启|登场|返场|更新)",
     re.IGNORECASE,
 )
+
+
+def _233_online_date(raw_json: str) -> str | None:
+    try:
+        raw = json.loads(raw_json or "{}")
+        online_time = str((raw.get("detail") or {}).get("onlineTime") or "")
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None
+    match = re.search(r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})", online_time)
+    if not match:
+        return None
+    year, month, day = map(int, match.groups())
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None
+
+
+def repair_233_launch_dates(conn: sqlite3.Connection) -> dict[str, int]:
+    """用详情页 onlineTime 修复被 Banner 投放时间污染的 233 首发日期。"""
+    rows = list(conn.execute(
+        """
+        SELECT * FROM source_items
+        WHERE source='233_leyuan' AND event_type='launch'
+        ORDER BY id
+        """
+    ))
+    corrected = duplicates = 0
+    with conn:
+        for row in rows:
+            expected = _233_online_date(row["raw_json"])
+            current = (row["event_time"] or "")[:10]
+            if not expected or expected == current:
+                continue
+            try:
+                distance = abs((date.fromisoformat(expected) - date.fromisoformat(current)).days)
+            except ValueError:
+                continue
+            if distance > 90:
+                continue
+            existing = conn.execute(
+                """
+                SELECT * FROM source_items
+                WHERE source='233_leyuan' AND source_item_id=?
+                  AND event_type='launch' AND event_time=? AND id<>?
+                """,
+                (row["source_item_id"], expected, row["id"]),
+            ).fetchone()
+            if existing:
+                try:
+                    merged_raw = {
+                        **json.loads(existing["raw_json"] or "{}"),
+                        **json.loads(row["raw_json"] or "{}"),
+                    }
+                except (json.JSONDecodeError, TypeError):
+                    merged_raw = json.loads(row["raw_json"] or "{}")
+                conn.execute(
+                    """
+                    UPDATE source_items SET
+                        name=?,
+                        package_name=COALESCE(NULLIF(?, ''), package_name),
+                        developer=COALESCE(NULLIF(?, ''), developer),
+                        category=COALESCE(NULLIF(?, ''), category),
+                        tags_json=CASE WHEN ?='[]' THEN tags_json ELSE ? END,
+                        gameplay_intro=CASE
+                            WHEN length(trim(COALESCE(?, ''))) >= length(trim(COALESCE(gameplay_intro, '')))
+                            THEN ? ELSE gameplay_intro END,
+                        full_description=CASE
+                            WHEN length(trim(COALESCE(?, ''))) >= length(trim(COALESCE(full_description, '')))
+                            THEN ? ELSE full_description END,
+                        icon_url=COALESCE(NULLIF(?, ''), icon_url),
+                        detail_url=COALESCE(NULLIF(?, ''), detail_url),
+                        rating=COALESCE(?, rating),
+                        version_name=COALESCE(NULLIF(?, ''), version_name),
+                        size_bytes=COALESCE(?, size_bytes),
+                        status=COALESCE(NULLIF(?, ''), status),
+                        first_seen_at=MIN(first_seen_at, ?),
+                        last_seen_at=MAX(last_seen_at, ?),
+                        raw_json=?
+                    WHERE id=?
+                    """,
+                    (
+                        row["name"], row["package_name"], row["developer"], row["category"],
+                        row["tags_json"], row["tags_json"], row["gameplay_intro"],
+                        row["gameplay_intro"], row["full_description"], row["full_description"],
+                        row["icon_url"], row["detail_url"], row["rating"], row["version_name"],
+                        row["size_bytes"], row["status"], row["first_seen_at"], row["last_seen_at"],
+                        json.dumps(merged_raw, ensure_ascii=False, separators=(",", ":")), existing["id"],
+                    ),
+                )
+                conn.execute("DELETE FROM canonical_members WHERE source_row_id=?", (row["id"],))
+                conn.execute("DELETE FROM source_items WHERE id=?", (row["id"],))
+                duplicates += 1
+            else:
+                conn.execute(
+                    "UPDATE source_items SET event_time=? WHERE id=?",
+                    (expected, row["id"]),
+                )
+                corrected += 1
+    return {"checked": len(rows), "corrected": corrected, "duplicates": duplicates}
 
 
 def classify_haoyou_event(name: str, summary: str) -> str | None:
