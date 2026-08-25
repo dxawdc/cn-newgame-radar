@@ -80,7 +80,9 @@ class EventQualityTest(unittest.TestCase):
 
             result = repair_233_launch_dates(conn)
 
-            self.assertEqual(result, {"checked": 2, "corrected": 0, "duplicates": 1})
+            self.assertEqual(result, {
+                "checked": 2, "corrected": 0, "reclassified": 0, "duplicates": 1,
+            })
             rows = conn.execute(
                 "SELECT event_time,status,last_seen_at,raw_json FROM source_items"
             ).fetchall()
@@ -102,9 +104,37 @@ class EventQualityTest(unittest.TestCase):
 
             result = repair_233_launch_dates(conn)
 
-            self.assertEqual(result, {"checked": 1, "corrected": 0, "duplicates": 0})
+            self.assertEqual(result, {
+                "checked": 1, "corrected": 0, "reclassified": 0, "duplicates": 0,
+            })
             event_time = conn.execute("SELECT event_time FROM source_items").fetchone()[0]
             self.assertEqual(event_time, "2026-08-24")
+            conn.close()
+
+    def test_233_schedule_announcement_is_removed_from_launch_semantics(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conn = connect(Path(folder) / "test.db")
+            upsert_items(conn, [{
+                "source": "233_leyuan", "source_item_id": "915955",
+                "name": "王者万象棋", "event_type": "launch", "event_time": "2026-08-27",
+                "status": "王者万象棋",
+                "raw": {
+                    "banner": {
+                        "name": "王者万象棋",
+                        "_config": {"content": "将于8月27日晚19点公布正式上线时间！"},
+                    },
+                    "detail": {"onlineTime": "2030-01-01 10:00:00"},
+                },
+            }], "2026-08-25T06:00:00+08:00")
+
+            result = repair_233_launch_dates(conn)
+
+            self.assertEqual(result, {
+                "checked": 1, "corrected": 0, "reclassified": 1, "duplicates": 0,
+            })
+            row = conn.execute("SELECT event_type,event_time,status FROM source_items").fetchone()
+            self.assertEqual((row["event_type"], row["event_time"]), ("announcement", "2026-08-27"))
+            self.assertEqual(row["status"], "将于8月27日晚19点公布正式上线时间！")
             conn.close()
 
 

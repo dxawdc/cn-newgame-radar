@@ -2,9 +2,26 @@ import unittest
 from datetime import datetime
 
 from newgame_monitor.collectors import _parse_233_event_date, _resolve_233_event_date
+from newgame_monitor.event_quality import classify_233_event
 
 
 class Leyuan233DateTest(unittest.TestCase):
+    def test_schedule_stream_is_announcement_not_launch(self):
+        self.assertEqual(
+            classify_233_event("将于8月27日晚19点公布正式上线时间！"),
+            "announcement",
+        )
+        self.assertEqual(
+            classify_233_event("8月27日王牌定档秀，上线日期即将揭晓！"),
+            "announcement",
+        )
+
+    def test_confirmed_launch_date_remains_launch(self):
+        self.assertEqual(
+            classify_233_event("定档8月21日正式上线，当天具体时间待定"),
+            "launch",
+        )
+
     def test_parser_accepts_detail_datetime(self):
         self.assertEqual(
             _parse_233_event_date("2026-08-21 09:00:00", None),

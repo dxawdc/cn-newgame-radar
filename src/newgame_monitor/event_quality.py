@@ -36,6 +36,35 @@ _OPERATIONAL_RELEASE = re.compile(
     r"[^，。；]{0,18}(?:上线|开放|开启|登场|返场|更新)",
     re.IGNORECASE,
 )
+_233_SCHEDULE_ANNOUNCEMENT = re.compile(
+    r"(?:定档(?:直播|秀)|"
+    r"(?:公布|揭晓|官宣|发布)[^，。；！!]{0,16}(?:正式|具体)?上线(?:日期|时间)|"
+    r"上线(?:日期|时间)[^，。；！!]{0,16}(?:公布|揭晓|待定|待公布))"
+)
+
+
+def classify_233_event(signal: str) -> str:
+    """区分 233 的正式产品事件与仅公布档期的运营公告。"""
+    text = re.sub(r"\s+", " ", signal or "").strip()
+    if _233_SCHEDULE_ANNOUNCEMENT.search(text):
+        return "announcement"
+    if any(word in text for word in ("测试", "开测", "招募", "内测")):
+        return "beta"
+    if "预下载" in text:
+        return "pre_download"
+    if any(word in text for word in ("上线", "首发", "发售", "公测")):
+        return "launch"
+    return "reservation"
+
+
+def _233_signal(raw: dict) -> str:
+    banner = raw.get("banner") or {}
+    config = banner.get("_config") or {}
+    detail = raw.get("detail") or {}
+    return " ".join(str(value or "") for value in (
+        banner.get("name"), config.get("content"), config.get("buttonText"),
+        detail.get("testStatus"), detail.get("briefIntro"),
+    ))
 
 
 def _233_online_date(raw_json: str) -> str | None:
@@ -55,7 +84,7 @@ def _233_online_date(raw_json: str) -> str | None:
 
 
 def repair_233_launch_dates(conn: sqlite3.Connection) -> dict[str, int]:
-    """用详情页 onlineTime 修复被 Banner 投放时间污染的 233 首发日期。"""
+    """修复 233 首发日期，并把“公布上线时间”公告移出首发口径。"""
     rows = list(conn.execute(
         """
         SELECT * FROM source_items
@@ -63,9 +92,39 @@ def repair_233_launch_dates(conn: sqlite3.Connection) -> dict[str, int]:
         ORDER BY id
         """
     ))
-    corrected = duplicates = 0
+    corrected = duplicates = reclassified = 0
     with conn:
         for row in rows:
+            try:
+                raw = json.loads(row["raw_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                raw = {}
+            classified = classify_233_event(_233_signal(raw))
+            if classified == "announcement":
+                existing_type = conn.execute(
+                    """
+                    SELECT id FROM source_items
+                    WHERE source='233_leyuan' AND source_item_id=?
+                      AND event_type=? AND event_time=? AND id<>?
+                    """,
+                    (row["source_item_id"], classified, row["event_time"], row["id"]),
+                ).fetchone()
+                if existing_type:
+                    conn.execute("DELETE FROM canonical_members WHERE source_row_id=?", (row["id"],))
+                    conn.execute("DELETE FROM source_items WHERE id=?", (row["id"],))
+                    duplicates += 1
+                else:
+                    banner = raw.get("banner") or {}
+                    config = banner.get("_config") or {}
+                    announcement_status = str(
+                        config.get("content") or row["status"] or banner.get("name") or ""
+                    )[:200]
+                    conn.execute(
+                        "UPDATE source_items SET event_type=?, status=? WHERE id=?",
+                        (classified, announcement_status, row["id"]),
+                    )
+                    reclassified += 1
+                continue
             expected = _233_online_date(row["raw_json"])
             current = (row["event_time"] or "")[:10]
             if not expected or expected == current:
@@ -135,7 +194,10 @@ def repair_233_launch_dates(conn: sqlite3.Connection) -> dict[str, int]:
                     (expected, row["id"]),
                 )
                 corrected += 1
-    return {"checked": len(rows), "corrected": corrected, "duplicates": duplicates}
+    return {
+        "checked": len(rows), "corrected": corrected,
+        "reclassified": reclassified, "duplicates": duplicates,
+    }
 
 
 def classify_haoyou_event(name: str, summary: str) -> str | None:

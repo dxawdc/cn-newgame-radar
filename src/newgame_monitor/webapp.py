@@ -226,6 +226,11 @@ def _event_date(row: sqlite3.Row) -> tuple[str, str]:
     return _iso_date(row["first_seen_at"]), "discovered"
 
 
+def _effective_event_type(row: sqlite3.Row) -> str:
+    """没有明确事件日期时，只能表示首次发现，不能冒充原事件已发生。"""
+    return row["event_type"] if _iso_date(row["event_time"]) else "first_seen"
+
+
 def _csv(values: list[str] | None) -> set[str]:
     result = set()
     for value in values or []:
@@ -331,7 +336,8 @@ def _serialize(game: dict, members: Iterable[sqlite3.Row] | None = None) -> dict
     seen_events = set()
     for row in selected:
         event_date, precision = _event_date(row)
-        key = (row["source"], row["event_type"], event_date, row["status"])
+        event_type = _effective_event_type(row)
+        key = (row["source"], event_type, event_date, row["status"])
         if key in seen_events:
             continue
         seen_events.add(key)
@@ -339,8 +345,8 @@ def _serialize(game: dict, members: Iterable[sqlite3.Row] | None = None) -> dict
             "source": row["source"],
             "source_label": SOURCE_LABELS.get(row["source"], row["source"]),
             "source_note": SOURCE_NOTES.get(row["source"]),
-            "type": row["event_type"],
-            "type_label": EVENT_LABELS.get(row["event_type"], row["event_type"]),
+            "type": event_type,
+            "type_label": EVENT_LABELS.get(event_type, event_type),
             "date": event_date,
             "date_precision": precision,
             "end_date": _iso_date(row["event_end_time"]),
@@ -461,7 +467,7 @@ def _filtered_games(
         for row in game["members"]:
             if sources and row["source"] not in sources:
                 continue
-            if event_types and row["event_type"] not in event_types:
+            if event_types and _effective_event_type(row) not in event_types:
                 continue
             event_day, _ = _event_date(row)
             event_date = date.fromisoformat(event_day) if event_day else None
@@ -1094,7 +1100,14 @@ def filters():
             "SELECT developer FROM canonical_games WHERE developer IS NOT NULL AND developer<>'' GROUP BY developer ORDER BY COUNT(*) DESC, developer LIMIT 100"
         )]
         present_sources = {row[0] for row in conn.execute("SELECT DISTINCT source FROM source_items")}
-        present_events = {row[0] for row in conn.execute("SELECT DISTINCT event_type FROM source_items")}
+        present_events = {row[0] for row in conn.execute(
+            """
+            SELECT DISTINCT CASE
+                WHEN trim(COALESCE(event_time, ''))='' THEN 'first_seen'
+                ELSE event_type END
+            FROM source_items
+            """
+        )}
     finally:
         conn.close()
     return {

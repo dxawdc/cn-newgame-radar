@@ -16,7 +16,7 @@ from .app_cache_collectors import (
     collect_oppo_ui,
     collect_xiaomi_cache,
 )
-from .event_quality import classify_haoyou_event
+from .event_quality import classify_233_event, classify_haoyou_event
 
 
 HEADERS = {"User-Agent": "NewGameMonitor/0.1 (+low-frequency research collector)"}
@@ -951,14 +951,7 @@ def collect_233() -> tuple[list[dict], list[tuple[str, bytes]]]:
             str(banner.get("name") or ""), str(config.get("content") or ""),
             str(config.get("buttonText") or ""), str(detail.get("testStatus") or ""),
         ])
-        if any(word in signal for word in ("测试", "开测", "招募", "内测")):
-            event_type = "beta"
-        elif "预下载" in signal:
-            event_type = "pre_download"
-        elif any(word in signal for word in ("上线", "首发", "发售")):
-            event_type = "launch"
-        else:
-            event_type = "reservation"
+        event_type = classify_233_event(signal)
         raw_tags = detail.get("tags") or []
         tags = []
         for tag in raw_tags:
@@ -985,7 +978,7 @@ def collect_233() -> tuple[list[dict], list[tuple[str, bytes]]]:
             "size_bytes": detail.get("fileSize64") or detail.get("fileSize") or None,
             "event_type": event_type,
             "event_time": event_time,
-            "status": str(banner.get("name") or config.get("content") or "")[:200],
+            "status": str(config.get("content") or banner.get("name") or "")[:200],
             "raw": {"banner": banner, "detail": detail},
         })
     latest = next(

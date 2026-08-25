@@ -30,6 +30,7 @@ SOURCE_ORDER = {source: index for index, source in enumerate(SOURCE_LABELS)}
 
 EVENT_LABELS = {
     "launch": "上线/首发",
+    "announcement": "定档/资讯",
     "beta": "测试",
     "limited_beta": "限量测试",
     "important_beta": "重点测试",
@@ -38,6 +39,7 @@ EVENT_LABELS = {
     "pre_download": "预下载",
     "timeline": "新游动态",
     "new_listing": "新收录",
+    "first_seen": "首次发现",
 }
 
 SOURCE_QUALITY = {
