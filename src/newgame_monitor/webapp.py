@@ -227,7 +227,7 @@ def _event_date(row: sqlite3.Row) -> tuple[str, str]:
 
 
 def _effective_event_type(row: sqlite3.Row) -> str:
-    """没有明确事件日期时，只能表示首次发现，不能冒充原事件已发生。"""
+    """没有明确事件日期时，只能表示首次采集发现，不能冒充原事件已发生。"""
     return row["event_type"] if _iso_date(row["event_time"]) else "first_seen"
 
 
@@ -236,6 +236,13 @@ def _csv(values: list[str] | None) -> set[str]:
     for value in values or []:
         result.update(item.strip() for item in value.split(",") if item.strip())
     return result
+
+
+def _event_scope(values: list[str] | None) -> set[str]:
+    """API 默认排除仅表示采集时间、没有明确业务日期的事件。"""
+    if values is None:
+        return set(EVENT_LABELS) - {"first_seen"}
+    return _csv(values)
 
 
 def _period_range(period: str, anchor: str | None) -> tuple[date | None, date | None]:
@@ -1034,7 +1041,7 @@ def export_favorites(request: Request):
         writer = csv.writer(output)
         writer.writerow([
             "游戏名称", "开发商", "品类", "玩法/介绍", "来源渠道", "最新事件",
-            "事件日期", "事件状态", "来源链接", "首次发现", "最近采集",
+            "事件日期", "事件状态", "来源链接", "首次采集发现", "最近采集",
             "首次关注时间", "最近一次关注时间",
         ])
         for payload in favorite_products:
@@ -1096,7 +1103,7 @@ def games(
     favorite_keys = set(favorite_dates)
     items = _filtered_games(
         period, anchor, date_from, date_to, _csv(source), _csv(category),
-        _csv(developer), _csv(event_type), q, view,
+        _csv(developer), _event_scope(event_type), q, view,
     )
     if followed:
         items = [item for item in items if item["key"] in favorite_keys]
@@ -1141,11 +1148,19 @@ def game_detail(game_id: int, request: Request):
 
 
 @app.get("/api/summary")
-def summary(anchor: str | None = None, view: str = "product"):
+def summary(
+    anchor: str | None = None, view: str = "product",
+    event_type: list[str] | None = Query(default=None),
+):
     if view not in {"product", "channel"}:
         raise HTTPException(status_code=422, detail="view 仅支持 product/channel")
     current = anchor or date.today().isoformat()
-    periods = {period: _filtered_games(period, current, view_mode=view) for period in ("day", "week", "month", "all")}
+    periods = {
+        period: _filtered_games(
+            period, current, event_types=_event_scope(event_type), view_mode=view,
+        )
+        for period in ("day", "week", "month", "all")
+    }
     conn = _conn()
     try:
         last = conn.execute(
@@ -1194,7 +1209,14 @@ def filters():
         ],
         "categories": categories,
         "developers": developers,
-        "event_types": [{"key": key, "label": EVENT_LABELS.get(key, key)} for key in EVENT_LABELS if key in present_events],
+        "event_types": [
+            {
+                "key": key, "label": EVENT_LABELS.get(key, key),
+                "default_included": key != "first_seen",
+                "note": "默认排除" if key == "first_seen" else None,
+            }
+            for key in EVENT_LABELS if key in present_events
+        ],
     }
 
 
@@ -1215,7 +1237,7 @@ def calendar(
     games = _filtered_games(
         "all", date_from=first.isoformat(), date_to=last.isoformat(),
         sources=_csv(source), categories=_csv(category), developers=_csv(developer),
-        event_types=_csv(event_type), q=q, view_mode=view,
+        event_types=_event_scope(event_type), q=q, view_mode=view,
     )
     counts, event_counts = Counter(), Counter()
     for game in games:

@@ -28,7 +28,7 @@ class WebAppTest(unittest.TestCase):
 
         self.assertEqual(_effective_event_type(member), "first_seen")
         self.assertEqual(payload["events"][0]["type"], "first_seen")
-        self.assertEqual(payload["events"][0]["type_label"], "首次发现")
+        self.assertEqual(payload["events"][0]["type_label"], "首次采集发现")
         self.assertEqual(payload["events"][0]["date_precision"], "discovered")
 
     def test_apple_source_is_last_and_marked_incomplete(self):
@@ -228,6 +228,19 @@ class CatalogDimensionTest(unittest.TestCase):
         self.assertEqual(set(by_type), {"beta", "launch", "first_seen"})
         self.assertEqual(by_type["beta"]["featured_event"]["date"], "2026-08-22")
         self.assertEqual(by_type["first_seen"]["featured_event"]["date"], "2026-08-25")
+
+    def test_api_event_scope_excludes_first_seen_by_default_and_can_include_it(self):
+        default_items = webapp._filtered_games(
+            "all", event_types=webapp._event_scope(None), view_mode="product"
+        )
+        self.assertNotIn(
+            "first_seen", {item["featured_event"]["type"] for item in default_items}
+        )
+        discovery_items = webapp._filtered_games(
+            "all", event_types=webapp._event_scope(["first_seen"]), view_mode="product"
+        )
+        self.assertEqual(len(discovery_items), 1)
+        self.assertEqual(discovery_items[0]["featured_event"]["type"], "first_seen")
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@
   <meta name="description" content="国内游戏分发渠道新游、首发、预约与测试事件聚合看板">
   <title>新游雷达 · Release Radar</title>
   <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="assets/app.css?v=20260825-event-dimensions">
+  <link rel="stylesheet" href="assets/app.css?v=20260825-first-seen-filter">
 </head>
 <body>
   <a class="skip-link" href="#catalogTitle">跳到新游列表</a>
@@ -95,8 +95,8 @@
           <kbd>⌘ K</kbd>
         </label>
         <div class="filter-block">
-          <h3>事件类型</h3>
-          <div id="eventFilters" class="chip-list"></div>
+          <div class="filter-block-title"><h3>事件类型</h3><small>取消勾选即可排除</small></div>
+          <div id="eventFilters" class="source-filter-list event-filter-list"></div>
         </div>
         <div class="filter-block">
           <h3>来源渠道</h3>
@@ -254,6 +254,6 @@
       </div>
     </div>
   </div>
-  <script src="assets/app.js?v=20260825-event-dimensions" defer></script>
+  <script src="assets/app.js?v=20260825-first-seen-filter" defer></script>
 </body>
 </html>

@@ -39,7 +39,7 @@ EVENT_LABELS = {
     "pre_download": "预下载",
     "timeline": "新游动态",
     "new_listing": "新收录",
-    "first_seen": "首次发现",
+    "first_seen": "首次采集发现",
 }
 
 SOURCE_QUALITY = {

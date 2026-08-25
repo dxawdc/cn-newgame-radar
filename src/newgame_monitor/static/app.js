@@ -50,6 +50,15 @@ const fmtTime = (value) => value ? new Intl.DateTimeFormat('zh-CN', {month:'nume
 const fmtFollowTime = (value) => value ? new Intl.DateTimeFormat('zh-CN', {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(new Date(value)) : '';
 const appBase = new URL('./', location.href);
 
+function eventTypeParams() {
+  if (!state.filters) return [];
+  return state.events.size ? [...state.events] : ['__none__'];
+}
+
+function defaultEventTypes() {
+  return new Set((state.filters?.event_types || []).filter(item => item.default_included !== false).map(item => item.key));
+}
+
 async function api(path, params = {}, options = {}) {
   const url = new URL(String(path).replace(/^\/+/, ''), appBase);
   Object.entries(params).forEach(([key, value]) => {
@@ -70,7 +79,7 @@ async function api(path, params = {}, options = {}) {
 }
 
 async function loadSummary() {
-  const data = await api('/api/summary', {anchor: state.anchor, view: state.dimension});
+  const data = await api('/api/summary', {anchor: state.anchor, view: state.dimension, event_type: eventTypeParams()});
   $('#metricToday').textContent = data.today;
   $('#metricWeek').textContent = data.week;
   $('#metricMonth').textContent = data.month;
@@ -85,7 +94,7 @@ async function loadSummary() {
 async function loadCalendar() {
   const data = await api('/api/calendar', {
     start: state.calendarStart, days: 28, view: state.dimension,
-    source: [...state.sources], event_type: [...state.events],
+    source: [...state.sources], event_type: eventTypeParams(),
     category: state.category, developer: state.developer, q: state.q,
   });
   const weekdays = ['日','一','二','三','四','五','六'];
@@ -110,16 +119,16 @@ async function loadCalendar() {
 
 async function loadFilters() {
   state.filters = await api('/api/filters');
-  $('#eventFilters').innerHTML = state.filters.event_types.map(item => `<button class="filter-chip" data-event="${item.key}">${escapeHTML(item.label)}</button>`).join('');
+  state.events = defaultEventTypes();
+  $('#eventFilters').innerHTML = state.filters.event_types.map(item => `<label class="source-check event-check ${item.key === 'first_seen' ? 'is-discovery' : ''}"><input type="checkbox" value="${item.key}" ${state.events.has(item.key) ? 'checked' : ''}><i></i><span>${escapeHTML(item.label)}</span>${item.note ? `<small class="event-check-note">${escapeHTML(item.note)}</small>` : ''}</label>`).join('');
   $('#sourceFilters').innerHTML = state.filters.sources.map(item => `<label class="source-check"><input type="checkbox" value="${item.key}"><i></i><span>${escapeHTML(item.label)}</span>${item.note ? `<small class="source-check-note">${escapeHTML(item.note)}</small>` : ''}</label>`).join('');
   $('#categorySelect').insertAdjacentHTML('beforeend', state.filters.categories.map(x => `<option>${escapeHTML(x)}</option>`).join(''));
   $('#developerSelect').insertAdjacentHTML('beforeend', state.filters.developers.map(x => `<option>${escapeHTML(x)}</option>`).join(''));
-  $$('.filter-chip').forEach(button => button.addEventListener('click', () => {
-    const value = button.dataset.event;
-    state.events.has(value) ? state.events.delete(value) : state.events.add(value);
-    button.classList.toggle('active'); state.page = 1; loadCalendar(); loadGames(); updateFilterPills();
+  $$('.event-filter-list .event-check input').forEach(input => input.addEventListener('change', () => {
+    input.checked ? state.events.add(input.value) : state.events.delete(input.value);
+    state.page = 1; loadSummary(); loadCalendar(); loadGames(); updateFilterPills();
   }));
-  $$('.source-check input').forEach(input => input.addEventListener('change', () => {
+  $$('.source-filter-list:not(.event-filter-list) .source-check input').forEach(input => input.addEventListener('change', () => {
     input.checked ? state.sources.add(input.value) : state.sources.delete(input.value);
     state.page = 1; loadCalendar(); loadGames(); updateFilterPills();
   }));
@@ -135,8 +144,8 @@ function gameCard(game, index) {
   const more = eventSources.length > 3 ? `<span class="source-tag source-more">+${eventSources.length-3}</span>` : '';
   const tags = [game.category, event.type_label, ...(game.tags || [])].filter(Boolean).filter((x,i,a)=>a.indexOf(x)===i).slice(0,4);
   const dateNote = state.dimension === 'product'
-    ? (event.date_precision === 'discovered' ? '最早首次发现' : `最早渠道${event.type_label || '事件'}`)
-    : (event.date_precision === 'discovered' ? '首次发现' : (event.type_label || '渠道事件'));
+    ? (event.date_precision === 'discovered' ? '最早首次采集发现' : `最早渠道${event.type_label || '事件'}`)
+    : (event.date_precision === 'discovered' ? '首次采集发现' : (event.type_label || '渠道事件'));
   const sourceContext = state.dimension === 'product' ? '最早发生渠道' : '事件来源';
   const laterEvents = state.dimension === 'product' && game.later_event_count
     ? `<p class="later-events">后续还有 <strong>${game.later_event_count}</strong> 个同类渠道事件，完整轨迹见详情</p>` : '';
@@ -158,7 +167,7 @@ async function loadGames() {
     const params = {
       period: state.dateFrom || state.dateTo ? 'all' : state.period, anchor: state.anchor,
       date_from: state.dateFrom, date_to: state.dateTo, source: [...state.sources],
-      event_type: [...state.events], category: state.category, developer: state.developer,
+      event_type: eventTypeParams(), category: state.category, developer: state.developer,
       q: state.q, sort: state.sort, page: state.page, page_size: state.pageSize,
       followed: state.followed, view: state.dimension,
     };
@@ -720,20 +729,33 @@ function updatePeriodUI() {
 function updateFilterPills() {
   const sourceLabels = Object.fromEntries((state.filters?.sources || []).map(x => [x.key, x.note ? `${x.label}（${x.note}）` : x.label]));
   const eventLabels = Object.fromEntries((state.filters?.event_types || []).map(x => [x.key,x.label]));
+  const allEventKeys = (state.filters?.event_types || []).map(x => x.key);
+  const excludedEvents = allEventKeys.filter(key => !state.events.has(key));
+  let eventFilterLabel = '';
+  if (excludedEvents.length === 1 && excludedEvents[0] === 'first_seen') {
+    eventFilterLabel = '已排除：首次采集发现';
+  } else if (excludedEvents.length === 0 && allEventKeys.includes('first_seen')) {
+    eventFilterLabel = '事件类型：全部（含首次采集发现）';
+  } else if (excludedEvents.length && excludedEvents.length <= 3) {
+    eventFilterLabel = `已排除：${excludedEvents.map(key => eventLabels[key]).filter(Boolean).join('、')}`;
+  } else if (allEventKeys.length) {
+    eventFilterLabel = `事件类型：已选 ${state.events.size}/${allEventKeys.length}`;
+  }
   const dateLabel = state.dateFrom || state.dateTo
     ? (state.dateFrom === state.dateTo ? fmtDate(state.dateFrom) : `${state.dateFrom ? fmtDate(state.dateFrom) : '最早'} — ${state.dateTo ? fmtDate(state.dateTo) : '最新'}`)
     : '';
-  const values = [...state.sources].map(x => sourceLabels[x]).concat([...state.events].map(x => eventLabels[x]), state.category, state.developer, dateLabel, state.followed ? '只看已关注' : '').filter(Boolean);
+  const values = [...state.sources].map(x => sourceLabels[x]).concat(eventFilterLabel, state.category, state.developer, dateLabel, state.followed ? '只看已关注' : '').filter(Boolean);
   $('#activeFilters').innerHTML = values.map(x => `<span class="active-pill">${escapeHTML(x)}</span>`).join('');
   $('#activeFilterCount').textContent = values.length + (state.q ? 1 : 0);
 }
 
 function resetFilters() {
-  state.sources.clear(); state.events.clear(); state.category = ''; state.developer = ''; state.q = ''; state.dateFrom = ''; state.dateTo = ''; state.followed = false; state.page = 1;
-  $$('.source-check input').forEach(x => x.checked = false); $$('.filter-chip').forEach(x => x.classList.remove('active'));
+  state.sources.clear(); state.events = defaultEventTypes(); state.category = ''; state.developer = ''; state.q = ''; state.dateFrom = ''; state.dateTo = ''; state.followed = false; state.page = 1;
+  $$('.source-filter-list:not(.event-filter-list) .source-check input').forEach(x => x.checked = false);
+  $$('.event-filter-list .event-check input').forEach(x => { x.checked = state.events.has(x.value); });
   $('#categorySelect').value = ''; $('#developerSelect').value = ''; $('#searchInput').value = '';
   $('#followedOnly').classList.remove('active');
-  updateDateWorkbench(); updatePeriodUI(); updateFilterPills(); loadCalendar(); loadGames();
+  updateDateWorkbench(); updatePeriodUI(); updateFilterPills(); loadSummary(); loadCalendar(); loadGames();
 }
 
 function bindUI() {
