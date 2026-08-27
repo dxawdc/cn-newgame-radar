@@ -77,10 +77,11 @@ _ACTIVITY_MODIFIER = (
     r"第[一二三四五六七八九十\d]+次|今日|明日|本轮|安卓|iOS|双端|全平台|"
     r"小规模|大规模|技术|封闭|公开|先锋|共研|抢先|先行|资格)"
 )
-_ACTIVITY_EVENT = (
+_ACTIVITY_EVENT_TOKEN = (
     r"(?:测试招募|抢先体验|预下载|开测|测试|内测|公测|封测|删测|首测|二测|"
     r"终测|预约|招募|预购|首发|上线|发售|开服)"
 )
+_ACTIVITY_EVENT = rf"(?:{_ACTIVITY_EVENT_TOKEN})(?:\s*{_ACTIVITY_EVENT_TOKEN})?"
 _ACTIVITY_PREFIX_STATE = r"(?:(?:现已|已|即将)?(?:开启|开放|启动)\s*)?"
 _ACTIVITY_STATE = (
     r"(?:(?:现已|已|即将)?(?:开启|开始|开放|启动)|进行中|招募中|"
