@@ -1,8 +1,10 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from newgame_monitor.enrichment import (
     _parse_haoyou_detail_html,
@@ -18,18 +20,50 @@ from newgame_monitor.enrichment import (
 )
 from newgame_monitor.app_cache_collectors import (
     _clean_ui_text,
+    _dump_ui,
     _huawei_event_fields,
     _oppo_screenshot_urls,
     _parse_honor_list,
     _oppo_explicit_date,
     _parse_oppo_today,
     _parse_oppo_timeline,
+    _wait_for_text_node,
     _xiaomi_event_time,
 )
 from newgame_monitor.db import connect, upsert_items
 
 
 class HaoYouDetailTest(unittest.TestCase):
+    def test_ui_dump_retries_transient_adb_failure(self):
+        failure = subprocess.CalledProcessError(137, ["adb", "uiautomator", "dump"])
+        with patch(
+            "newgame_monitor.app_cache_collectors._adb",
+            side_effect=[failure, b"dumped", b"<hierarchy />"],
+        ) as adb, patch("newgame_monitor.app_cache_collectors.time.sleep") as sleep:
+            xml = _dump_ui("oppo-launch-1")
+
+        self.assertEqual(xml, b"<hierarchy />")
+        self.assertEqual(adb.call_count, 3)
+        sleep.assert_called_once_with(1.5)
+
+    def test_honor_home_waits_for_new_game_tab(self):
+        loading = b'<hierarchy><node package="com.hihonor.gamecenter" /></hierarchy>'
+        ready = (
+            b'<hierarchy><node package="com.hihonor.gamecenter" text="\xe6\x96\xb0\xe6\xb8\xb8" '
+            b'bounds="[150,240][278,392]" /></hierarchy>'
+        )
+
+        with patch(
+            "newgame_monitor.app_cache_collectors._dump_ui", return_value=ready,
+        ) as dump_ui, patch("newgame_monitor.app_cache_collectors.time.sleep"):
+            node, latest = _wait_for_text_node(
+                loading, "新游", dump_prefix="honor-home-ready", max_top=500,
+            )
+
+        self.assertIsNotNone(node)
+        self.assertEqual(latest, ready)
+        dump_ui.assert_called_once_with("honor-home-ready-1")
+
     def test_huawei_game_event_uses_recruitment_type_and_start_time(self):
         event_type, event_time, status = _huawei_event_fields({
             "gcode": "GameEvent",

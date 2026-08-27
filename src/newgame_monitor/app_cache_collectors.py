@@ -251,10 +251,18 @@ def _tap_node(node) -> None:
     _adb("shell", "input", "tap", str((left + right) // 2), str((top + bottom) // 2))
 
 
-def _dump_ui(name: str) -> bytes:
+def _dump_ui(name: str, attempts: int = 3) -> bytes:
     remote = f"/sdcard/{name}.xml"
-    _adb("shell", "uiautomator", "dump", remote)
-    return _adb("exec-out", "cat", remote)
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            _adb("shell", "uiautomator", "dump", remote)
+            return _adb("exec-out", "cat", remote)
+        except (OSError, subprocess.SubprocessError) as exc:
+            last_error = exc
+            if attempt < attempts - 1:
+                time.sleep(1.5)
+    raise last_error
 
 
 def _capture_screen() -> bytes:
@@ -544,6 +552,23 @@ def _node_by_text(root, text: str, *, max_top: int | None = None, min_top: int |
     return matches[0] if matches else None
 
 
+def _wait_for_text_node(
+    xml: bytes, text: str, *, dump_prefix: str, attempts: int = 6,
+    delay_seconds: float = 3, max_top: int | None = None, min_top: int | None = None,
+):
+    """等待异步加载的页面入口出现在 UI 树中，并返回节点及最新 UI。"""
+    latest = xml
+    for attempt in range(attempts):
+        root = ET.fromstring(latest)
+        node = _node_by_text(root, text, max_top=max_top, min_top=min_top)
+        if node is not None:
+            return node, latest
+        if attempt < attempts - 1:
+            time.sleep(delay_seconds)
+            latest = _dump_ui(f"{dump_prefix}-{attempt + 1}")
+    return None, latest
+
+
 def _start_app(package: str, component: str, wait_seconds: float = 6) -> bytes:
     _adb("shell", "am", "force-stop", package)
     _adb("shell", "am", "start", "-n", component)
@@ -675,8 +700,9 @@ def collect_honor_ui() -> tuple[list[dict], list[tuple[str, bytes]]]:
         "com.hihonor.gamecenter",
         "com.hihonor.gamecenter/.bu_games_display.splash.SplashActivity",
     )
-    root = ET.fromstring(start_xml)
-    new_tab = _node_by_text(root, "新游", max_top=500)
+    new_tab, start_xml = _wait_for_text_node(
+        start_xml, "新游", dump_prefix="honor-home-ready", max_top=500,
+    )
     if new_tab is None:
         raise ValueError("荣耀游戏中心首页未找到“新游”页签")
     _tap_node(new_tab)
