@@ -16,6 +16,8 @@ from pathlib import Path
 
 from PIL import Image, ImageStat
 
+from .catalog import normalize_game_name
+
 
 SERIAL = os.environ.get("NEWGAME_ADB_SERIAL", "127.0.0.1:16384")
 
@@ -291,6 +293,18 @@ def _ui_detail_enabled(source: str, name: str) -> bool:
     except json.JSONDecodeError:
         return False
     return name in targets.get(source, [])
+
+
+def _oppo_missing_detail_enabled(name: str) -> bool:
+    """仅为数据库中尚未完整回填的 OPPO 产品打开详情页。"""
+    raw = os.environ.get("NEWGAME_OPPO_COMPLETE_DETAILS")
+    if raw is None:
+        return False
+    try:
+        complete = set(json.loads(raw))
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return normalize_game_name(name) not in complete
 
 
 def _text_by_suffix(root, suffix: str) -> str | None:
@@ -739,8 +753,30 @@ def _attach_oppo_offline_metadata(items: list[dict], blobs: list[bytes] | None =
                 else:
                     cards_by_name.pop(name, None)
                     ambiguous_names.add(name)
+    cards_by_normalized_name: dict[str, dict] = {}
+    ambiguous_normalized_names: set[str] = set()
+    for name, card in cards_by_name.items():
+        normalized = normalize_game_name(name)
+        if not normalized or normalized in ambiguous_normalized_names:
+            continue
+        existing = cards_by_normalized_name.get(normalized)
+        if existing is None:
+            cards_by_normalized_name[normalized] = card
+        elif existing["app_id"] != card["app_id"]:
+            cards_by_normalized_name.pop(normalized, None)
+            ambiguous_normalized_names.add(normalized)
+        else:
+            for key, value in card.items():
+                if not existing.get(key) and value:
+                    existing[key] = value
     for item in items:
         matched = cards_by_name.get(item["name"])
+        matched_by = "exact_name"
+        if not matched:
+            normalized = normalize_game_name(item["name"])
+            if normalized not in ambiguous_normalized_names:
+                matched = cards_by_normalized_name.get(normalized)
+                matched_by = "normalized_name"
         if not matched:
             continue
         item["package_name"] = item.get("package_name") or matched["package_name"]
@@ -753,6 +789,7 @@ def _attach_oppo_offline_metadata(items: list[dict], blobs: list[bytes] | None =
         item.setdefault("raw", {})["oppo_offline_detail"] = {
             key: value for key, value in matched.items() if value
         }
+        item["raw"]["oppo_offline_detail"]["matched_by"] = matched_by
 
 
 def _attach_ui_icons(
@@ -1237,14 +1274,17 @@ def _enrich_visible_oppo_details(xml: bytes, items: list[dict], detail_seen: set
     for node in candidates:
         name = node.get("text").strip()
         item = by_name[name]
-        if name in detail_seen or not _ui_detail_enabled("oppo_gamecenter", name):
+        if name in detail_seen or not (
+            _ui_detail_enabled("oppo_gamecenter", name)
+            or _oppo_missing_detail_enabled(name)
+        ):
             continue
-        detail_seen.add(name)
         try:
             _tap_node(node)
             time.sleep(2.5)
             detail = _capture_oppo_detail(name)
             _merge_ui_detail(item, detail, source="oppo_gamecenter_app")
+            detail_seen.add(name)
         except (OSError, subprocess.SubprocessError, ET.ParseError, ValueError) as exc:
             item.setdefault("raw", {})["ui_detail_error"] = str(exc)[:300]
         finally:

@@ -190,6 +190,17 @@ class HaoYouDetailTest(unittest.TestCase):
         self.assertEqual(detail["app_id"], "36969909")
         self.assertEqual(detail["package_name"], "ShinchanMatchDaily.nearme.gamecenter")
 
+    def test_oppo_resource_matches_normalized_activity_name(self):
+        item = {"name": "大梦仙途（删档测试）", "raw": {}, "tags": []}
+        blob = self._oppo_resource_card(
+            37600001, "大梦仙途", "com.example.dream",
+        )
+        _attach_oppo_offline_metadata([item], [blob])
+        detail = item["raw"]["oppo_offline_detail"]
+        self.assertEqual(detail["app_id"], "37600001")
+        self.assertEqual(detail["matched_by"], "normalized_name")
+        self.assertEqual(len(detail["screenshot_urls"]), 5)
+
     def test_oppo_resource_rejects_app_id_link_mismatch(self):
         item = {"name": "错配卡片", "raw": {}, "tags": []}
         blob = self._oppo_resource_card(
@@ -224,6 +235,29 @@ class HaoYouDetailTest(unittest.TestCase):
             xml, [{"name": "beta game", "event_type": "beta", "raw": {}}], set(),
         )
         tap.assert_not_called()
+
+    @patch("newgame_monitor.app_cache_collectors.time.sleep")
+    @patch("newgame_monitor.app_cache_collectors._adb")
+    @patch("newgame_monitor.app_cache_collectors._capture_oppo_detail")
+    @patch("newgame_monitor.app_cache_collectors._tap_node")
+    def test_oppo_missing_detail_is_opened_by_incremental_backfill(
+        self, tap, capture_detail, _adb, _sleep,
+    ):
+        xml = (
+            b'<hierarchy><node resource-id="com.nearme.gamecenter:id/appName" '
+            b'text="new game" bounds="[0,0][100,100]" /></hierarchy>'
+        )
+        capture_detail.return_value = {
+            "description": "完整游戏介绍", "screenshot_urls": ["local-screenshot://gallery/1.webp"],
+        }
+        item = {"name": "new game", "event_type": "beta", "raw": {}, "tags": []}
+        with patch.dict(
+            os.environ, {"NEWGAME_OPPO_COMPLETE_DETAILS": "[]"}, clear=False,
+        ):
+            _enrich_visible_oppo_details(xml, [item], set())
+        tap.assert_called_once()
+        self.assertEqual(item["full_description"], "完整游戏介绍")
+        self.assertEqual(len(item["raw"]["ui_detail"]["screenshot_urls"]), 1)
 
     def test_oppo_snapshot_enrichment_preserves_captured_gallery(self):
         with tempfile.TemporaryDirectory() as folder:

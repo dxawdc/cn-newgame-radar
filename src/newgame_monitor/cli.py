@@ -27,6 +27,34 @@ from .enrichment import (
 from .event_quality import prune_legacy_haoyou_timeline, repair_233_launch_dates
 
 
+def _oppo_complete_detail_names(conn) -> list[str]:
+    """返回已有完整介绍和图集的 OPPO 产品归一化名称。"""
+    from .catalog import normalize_game_name
+
+    complete = set()
+    rows = conn.execute(
+        "SELECT name,full_description,raw_json FROM source_items "
+        "WHERE source='oppo_gamecenter'"
+    )
+    for row in rows:
+        if not (row["full_description"] or "").strip():
+            continue
+        try:
+            raw = json.loads(row["raw_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        ui_detail = raw.get("ui_detail") or {}
+        offline_detail = raw.get("oppo_offline_detail") or {}
+        screenshots = (
+            ui_detail.get("screenshot_urls")
+            or offline_detail.get("screenshot_urls")
+            or []
+        )
+        if screenshots:
+            complete.add(normalize_game_name(row["name"]))
+    return sorted(complete)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="国内新游每日采集")
     parser.add_argument(
@@ -52,6 +80,11 @@ def main() -> int:
 
     observed = datetime.now().astimezone()
     conn = connect(args.db)
+    if "oppo-ui" in args.sources and not args.ui_details:
+        # 日常任务只打开尚缺“完整介绍 + 图集”的产品；已补齐产品不重复进详情。
+        os.environ["NEWGAME_OPPO_COMPLETE_DETAILS"] = json.dumps(
+            _oppo_complete_detail_names(conn), ensure_ascii=False,
+        )
     summary = {}
     for source in args.sources:
         started = datetime.now().astimezone().isoformat()
