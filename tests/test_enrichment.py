@@ -312,6 +312,39 @@ class HaoYouDetailTest(unittest.TestCase):
             relative = urls[0].removeprefix("local-screenshot://")
             self.assertTrue((Path(folder) / relative).is_file())
 
+    @patch("newgame_monitor.app_cache_collectors.time.sleep")
+    @patch("newgame_monitor.app_cache_collectors._dump_ui")
+    @patch("newgame_monitor.app_cache_collectors._adb")
+    def test_oppo_gallery_resets_remembered_horizontal_position(self, adb, dump_ui, _sleep):
+        clipped = ET.fromstring("""
+        <hierarchy><node resource-id="com.nearme.gamecenter:id/screenshots_view"
+          class="android.widget.HorizontalScrollView" bounds="[0,600][1440,1400]">
+          <node class="android.widget.ImageView" content-desc="图片"
+            bounds="[1407,700][1440,1300]" />
+        </node></hierarchy>
+        """.encode("utf-8"))
+        reset_xml = """
+        <hierarchy><node resource-id="com.nearme.gamecenter:id/screenshots_view"
+          class="android.widget.HorizontalScrollView" bounds="[0,600][1440,1400]">
+          <node class="android.widget.ImageView"
+            bounds="[64,700][1376,1300]" />
+        </node></hierarchy>
+        """.encode("utf-8")
+        dump_ui.return_value = reset_xml
+        image = Image.new("RGB", (1440, 2560), (20, 100, 180))
+        buffer = BytesIO()
+        image.save(buffer, "PNG")
+        with tempfile.TemporaryDirectory() as folder, patch.dict(
+            os.environ, {"NEWGAME_ICON_DIR": folder}, clear=False,
+        ), patch(
+            "newgame_monitor.app_cache_collectors._capture_screen",
+            return_value=buffer.getvalue(),
+        ):
+            urls = _capture_oppo_gallery("横向复位测试", clipped, max_images=1)
+        self.assertEqual(len(urls), 1)
+        adb.assert_called_once()
+        self.assertIn("gallery-reset-1", dump_ui.call_args.args[0])
+
     def test_ui_dump_retries_transient_adb_failure(self):
         failure = subprocess.CalledProcessError(137, ["adb", "uiautomator", "dump"])
         with patch(

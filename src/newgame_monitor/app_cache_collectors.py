@@ -357,10 +357,41 @@ def _capture_oppo_gallery(expected_name: str, root, *, max_images: int = 5) -> l
         candidates = [
             item for item in gallery.iter("node")
             if item.get("class") == "android.widget.ImageView"
-            and item.get("content-desc") in {"图片", "视频"}
             and (_bounds(item)[2] - _bounds(item)[0]) >= 240
             and (_bounds(item)[3] - _bounds(item)[1]) >= 160
         ]
+        # 详情页会记住横向图集上次的滚动位置；若停在最右侧，UI 树里可能只剩
+        # 一条不足 40px 的图片边缘。先右滑回到图集起点，再重新识别完整卡片。
+        for reset_index in range(2):
+            if candidates:
+                break
+            gallery_left, gallery_top, gallery_right, gallery_bottom = _bounds(gallery)
+            _adb(
+                "shell", "input", "swipe",
+                str(min(gallery_right - 160, gallery_left + 160)),
+                str((gallery_top + gallery_bottom) // 2),
+                str(max(gallery_left + 160, gallery_right - 160)),
+                str((gallery_top + gallery_bottom) // 2), "450",
+            )
+            time.sleep(0.7)
+            current_root = ET.fromstring(_dump_ui(
+                f"oppo-detail-{name_hash}-gallery-reset-{reset_index + 1}"
+            ))
+            gallery = next(
+                (
+                    item for item in current_root.iter("node")
+                    if item.get("resource-id", "").endswith("/screenshots_view")
+                ),
+                None,
+            )
+            if gallery is None:
+                break
+            candidates = [
+                item for item in gallery.iter("node")
+                if item.get("class") == "android.widget.ImageView"
+                and (_bounds(item)[2] - _bounds(item)[0]) >= 240
+                and (_bounds(item)[3] - _bounds(item)[1]) >= 160
+            ]
         if not candidates:
             break
         image_node = max(
