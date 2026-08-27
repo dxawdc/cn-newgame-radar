@@ -57,19 +57,63 @@ SOURCE_QUALITY = {
 }
 
 _CHANNEL_SUFFIXES = re.compile(
-    r"(?:[（(](?:官服|官方|测试版|测试服|先遣服|体验服|预约版)[）)]|"
-    r"[-—_](?:官服|官方版|测试版|测试服|先遣服|体验服|预约|预下载))$",
+    r"(?:[（(](?:官服|官方(?:版)?|TapTap测试版|测试版|测试服|先遣服|体验服|预约版|"
+    r"(?:PC|安卓|iOS)(?:端|版)?)[）)]|"
+    r"[-—_](?:官服|官方版|TapTap测试版|测试版|测试服|先遣服|体验服|预约版?|"
+    r"预下载|(?:PC|安卓|iOS)(?:端|版)?))$",
     re.IGNORECASE,
 )
-_EVENT_SUFFIX = re.compile(
-    r"[-—_]?(?:\d{1,2}月\d{1,2}日|\d{1,2}[.·]\d{1,2})"
-    r"(?:上线|首发|开测|测试开启|预下载开启|发售)$"
+_ACTIVITY_CALENDAR_DATE = (
+    r"(?:(?:19|20)\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|"
+    r"(?:20\d{2}年)?\d{1,2}月\d{1,2}[日号]?|\d{1,2}[.·/-]\d{1,2})"
 )
-_MARKETING_PAREN = re.compile(
-    r"[（(][^）)]*(?:开启|安装|登录|赠送|送|赢|超变|联动|预约|首发|官服|版本|狂欢)[^）)]*[）)]$"
+_ACTIVITY_DATE = (
+    rf"(?:{_ACTIVITY_CALENDAR_DATE}(?:\s*\d{{1,2}}:\d{{2}})?|"
+    r"(?:今日|明日)\s*\d{1,2}:\d{2})"
 )
-_MARKETING_DASH = re.compile(
-    r"[-—_][^-—_]*(?:登录送|全员|赠送|联动|预约|首发|上线|版本)[^-—_]*$"
+_ACTIVITY_MODIFIER = (
+    r"(?:限时|限量|限号|删档|不删档|计费|不计费|付费|正式|首次|首轮|二次|三次|末次|最终|"
+    r"第[一二三四五六七八九十\d]+次|今日|明日|本轮|安卓|iOS|双端|全平台|"
+    r"小规模|大规模|技术|封闭|公开|先锋|共研|抢先|先行|资格)"
+)
+_ACTIVITY_EVENT = (
+    r"(?:测试招募|抢先体验|预下载|开测|测试|内测|公测|封测|删测|首测|二测|"
+    r"终测|预约|招募|预购|首发|上线|发售|开服)"
+)
+_ACTIVITY_PREFIX_STATE = r"(?:(?:现已|已|即将)?(?:开启|开放|启动)\s*)?"
+_ACTIVITY_STATE = (
+    r"(?:(?:现已|已|即将)?(?:开启|开始|开放|启动)|进行中|招募中|"
+    r"定档|倒计时|中)?"
+)
+_ACTIVITY_SUFFIX_BODY = (
+    rf"(?:{_ACTIVITY_DATE}\s*)?{_ACTIVITY_PREFIX_STATE}(?:{_ACTIVITY_MODIFIER}\s*)*"
+    rf"{_ACTIVITY_PREFIX_STATE}{_ACTIVITY_EVENT}{_ACTIVITY_STATE}(?:\s*{_ACTIVITY_DATE})?"
+)
+_ACTIVITY_PAREN = re.compile(
+    rf"[（(【]\s*{_ACTIVITY_SUFFIX_BODY}\s*[!！]*\s*[）)】]$", re.IGNORECASE,
+)
+_ACTIVITY_DASH = re.compile(
+    rf"[-—_]\s*{_ACTIVITY_SUFFIX_BODY}\s*[!！]*\s*$", re.IGNORECASE,
+)
+_PROMO_REWARD = (
+    r"(?:\d+|[一二三四五六七八九十百千万]+)(?:连抽|抽|元|个|份|套|枚|钻石|金币|代金券)?|"
+    r"真充|礼包|代金券|时装|奖励|钻石|金币|福利|豪礼|皮肤|道具"
+)
+_PROMO_SUFFIX_BODY = (
+    rf"(?:(?:登录|登陆|安装|预约|首发|公测|上线|开服|全员)(?:即)?"
+    rf"(?:(?:赠送|领取|送|赢|锁定).{{1,32}}|(?:领|得|抽)\s*(?:{_PROMO_REWARD}).{{0,20}})|"
+    rf"(?:赠送|送)\s*(?:{_PROMO_REWARD}).{{0,20}})"
+)
+_PROMO_PAREN = re.compile(
+    rf"[（(]\s*{_PROMO_SUFFIX_BODY}\s*[）)]$", re.IGNORECASE,
+)
+_PROMO_DASH = re.compile(
+    rf"[-—_]\s*{_PROMO_SUFFIX_BODY}\s*$", re.IGNORECASE,
+)
+_CAMPAIGN_DASH = re.compile(
+    r"[-—_](?:[^-—_]{1,40}(?:联动开启|联动上线)|\d+周年庆|"
+    r"\d+月新版本|S\d+新赛季开启)[!！]*$",
+    re.IGNORECASE,
 )
 
 # 仅收录已由多个来源逐项核验过的渠道营销名，避免用模糊相似度误合并同名游戏。
@@ -81,6 +125,11 @@ _VERIFIED_NAME_ALIASES = {
     "家园:梦想派对-城邦轻策略手游": "家园:梦想派对",
     "蜀山幻想志-推关解千抽": "蜀山幻想志",
     "客官里面请(删档测试)": "客官里面请",
+    "一念长安(入长安开启回合新章)": "一念长安",
+    "夜幕之下-全员恶人群像": "夜幕之下",
+    "绝境猎人(西部狂欢热)": "绝境猎人",
+    "开天英雄(超变传奇刀刀真充)": "开天英雄",
+    "至尊传说(超变传奇)": "至尊传说",
 }
 
 
@@ -91,9 +140,11 @@ def clean_game_name(name: str) -> str:
     while value != previous:
         previous = value
         value = _CHANNEL_SUFFIXES.sub("", value).strip()
-        value = _EVENT_SUFFIX.sub("", value).strip()
-        value = _MARKETING_PAREN.sub("", value).strip()
-        value = _MARKETING_DASH.sub("", value).strip()
+        value = _ACTIVITY_PAREN.sub("", value).strip()
+        value = _ACTIVITY_DASH.sub("", value).strip()
+        value = _PROMO_PAREN.sub("", value).strip()
+        value = _PROMO_DASH.sub("", value).strip()
+        value = _CAMPAIGN_DASH.sub("", value).strip()
         value = _VERIFIED_NAME_ALIASES.get(value, value)
     return value or (name or "未知名称").strip()
 
@@ -167,6 +218,10 @@ def rebuild_catalog(conn: sqlite3.Connection) -> int:
             icon = _best(members, "icon_url")
             ratings = [float(row["rating"]) for row in members if row["rating"] is not None]
             sources = {row["source"] for row in members}
+            event_keys = {
+                (row["source"], row["event_type"] if row["event_time"] else "first_seen")
+                for row in members
+            }
             cursor = conn.execute(
                 """
                 INSERT INTO canonical_games (
@@ -181,7 +236,7 @@ def rebuild_catalog(conn: sqlite3.Connection) -> int:
                     round(sum(ratings) / len(ratings), 1) if ratings else None,
                     min(row["first_seen_at"] for row in members),
                     max(row["last_seen_at"] for row in members),
-                    len(sources), len(members),
+                    len(sources), len(event_keys),
                 ),
             )
             game_id = cursor.lastrowid

@@ -177,6 +177,10 @@ class CatalogDimensionTest(unittest.TestCase):
             {**common, "source": "uc_9game", "source_item_id": "uc-1", "event_type": "launch", "event_time": "", "status": "首次采集"},
         ]
         upsert_items(conn, rows, "2026-08-25T06:00:00+08:00")
+        upsert_items(conn, [{
+            **common, "source": "haoyou_kuaibao", "source_item_id": "hy-2",
+            "event_type": "launch", "event_time": "2026-08-26", "status": "延期后上线",
+        }], "2026-08-26T06:00:00+08:00")
         rebuild_catalog(conn)
         conn.close()
 
@@ -201,14 +205,22 @@ class CatalogDimensionTest(unittest.TestCase):
             for item in items
             if item["featured_event"]["type"] == "launch"
         )
-        self.assertEqual(launch_dates, ["2026-08-23", "2026-08-23", "2026-08-24"])
+        self.assertEqual(launch_dates, ["2026-08-23", "2026-08-23", "2026-08-26"])
 
     def test_source_scope_recalculates_product_earliest_date(self):
         items = webapp._filtered_games(
             "all", sources={"haoyou_kuaibao"}, view_mode="product"
         )
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["featured_event"]["date"], "2026-08-24")
+        self.assertEqual(items[0]["featured_event"]["date"], "2026-08-26")
+
+    def test_same_product_event_source_keeps_latest_observation(self):
+        items = webapp._filtered_games(
+            "all", sources={"haoyou_kuaibao"}, event_types={"launch"}, view_mode="channel",
+        )
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["featured_event"]["date"], "2026-08-26")
+        self.assertEqual(items[0]["featured_event"]["status"], "延期后上线")
 
     def test_date_filter_runs_after_product_aggregation(self):
         items = webapp._filtered_games(
@@ -220,7 +232,7 @@ class CatalogDimensionTest(unittest.TestCase):
             "all", date_from="2026-08-24", date_to="2026-08-24",
             sources={"haoyou_kuaibao"}, event_types={"launch"}, view_mode="product",
         )
-        self.assertEqual(len(scoped), 1)
+        self.assertEqual(scoped, [])
 
     def test_different_event_types_and_first_seen_remain_separate(self):
         items = webapp._filtered_games("all", view_mode="product")

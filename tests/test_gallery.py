@@ -44,6 +44,16 @@ class GalleryAndLinksTest(unittest.TestCase):
             }),
             ["https://img.example/haoyou-1.jpg"],
         )
+        self.assertEqual(
+            extract_gallery_urls("oppo_gamecenter", {
+                "ui_detail": {
+                    "screenshot_urls": [
+                        "local-screenshot://gallery/oppo_gamecenter/sample.webp"
+                    ]
+                }
+            }),
+            ["local-screenshot://gallery/oppo_gamecenter/sample.webp"],
+        )
 
     def test_real_screenshots_precede_marketing_fallbacks(self):
         tap = {

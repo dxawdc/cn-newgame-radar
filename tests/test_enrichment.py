@@ -1,10 +1,16 @@
+import hashlib
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
+
+from PIL import Image
 
 from newgame_monitor.enrichment import (
     _parse_haoyou_detail_html,
@@ -17,11 +23,19 @@ from newgame_monitor.enrichment import (
     _repair_huawei_names_from_official_details,
     enrich_9game_screenshots,
     enrich_name_lookup_fallback,
+    enrich_oppo_offline_media,
+    enrich_oppo_ui_snapshots,
 )
 from newgame_monitor.app_cache_collectors import (
+    _OPPO_OFFLINE_BLOB_CACHE,
+    _attach_oppo_offline_metadata,
     _clean_ui_text,
+    _capture_oppo_gallery,
     _dump_ui,
+    _enrich_visible_oppo_details,
     _huawei_event_fields,
+    _oppo_network_response_data,
+    _oppo_offline_blobs,
     _oppo_screenshot_urls,
     _parse_honor_list,
     _oppo_explicit_date,
@@ -34,6 +48,236 @@ from newgame_monitor.db import connect, upsert_items
 
 
 class HaoYouDetailTest(unittest.TestCase):
+    @staticmethod
+    def _protobuf_varint(value):
+        output = bytearray()
+        while value > 0x7f:
+            output.append((value & 0x7f) | 0x80)
+            value >>= 7
+        output.append(value)
+        return bytes(output)
+
+    @classmethod
+    def _protobuf_field(cls, number, value):
+        if isinstance(value, int):
+            return cls._protobuf_varint(number << 3) + cls._protobuf_varint(value)
+        payload = value.encode("utf-8") if isinstance(value, str) else value
+        return (
+            cls._protobuf_varint((number << 3) | 2)
+            + cls._protobuf_varint(len(payload)) + payload
+        )
+
+    @classmethod
+    def _oppo_resource_card(
+        cls, app_id, name, package_name, *, with_link=True, link_id=None,
+    ):
+        fields = [
+            cls._protobuf_field(127, "com.heytap.cdo.common.domain.dto.ResourceDto"),
+            cls._protobuf_field(1, app_id),
+            cls._protobuf_field(3, name),
+            cls._protobuf_field(7, package_name),
+            cls._protobuf_field(14, f"https://gc-image.heytapimage.com/{app_id}/icon.png"),
+            cls._protobuf_field(26, f"{name}的一句话玩法介绍"),
+            cls._protobuf_field(30, "角色扮演"),
+        ]
+        fields.extend(
+            cls._protobuf_field(
+                32, f"https://gc-image.heytapimage.com/{app_id}/{index}.jpg",
+            )
+            for index in range(1, 6)
+        )
+        if with_link:
+            fields.append(cls._protobuf_field(60, f"oap://gc/dt?id={link_id or app_id}"))
+        return b"".join(fields)
+
+    def test_oppo_java_network_response_extracts_business_data(self):
+        payload = self._oppo_resource_card(36309165, "粒粒的小人国", "com.tencent.lifeH")
+        java_array = (
+            b"\xac\xed\x00\x05com.nearme.network.internal.NetworkResponse"
+            b"\x75\x72\x00\x02[B"
+            b"\xac\xf3\x17\xf8\x06\x08\x54\xe0\x02\x00\x00\x78\x70"
+            + len(payload).to_bytes(4, "big") + payload + b"tail"
+        )
+        self.assertEqual(_oppo_network_response_data(java_array), payload)
+        self.assertIsNone(_oppo_network_response_data(payload))
+
+    @patch("newgame_monitor.app_cache_collectors._oppo_network_response_data")
+    @patch("newgame_monitor.app_cache_collectors._read_root_file")
+    @patch("newgame_monitor.app_cache_collectors._adb")
+    def test_oppo_offline_cache_remembers_negative_and_refreshes_changed_hash(
+        self, adb, read_root, extract,
+    ):
+        state = {"digest": "a" * 64}
+
+        def adb_result(*args):
+            if "ls -1t" in args[-1]:
+                return b"/cache/sample.0\n"
+            return f"{state['digest']}  /cache/sample.0\n".encode()
+
+        adb.side_effect = adb_result
+        read_root.side_effect = [b"first", b"second"]
+        extract.side_effect = [None, b"changed-payload"]
+        _OPPO_OFFLINE_BLOB_CACHE.clear()
+        self.assertEqual(_oppo_offline_blobs(), [])
+        self.assertEqual(_oppo_offline_blobs(), [])
+        self.assertEqual(read_root.call_count, 1)
+        state["digest"] = "b" * 64
+        self.assertEqual(_oppo_offline_blobs(), [b"changed-payload"])
+        self.assertEqual(read_root.call_count, 2)
+        _OPPO_OFFLINE_BLOB_CACHE.clear()
+
+    def test_oppo_resource_fields_keep_adjacent_cards_isolated(self):
+        blob = b"".join([
+            self._protobuf_field(
+                10, self._oppo_resource_card(36309165, "粒粒的小人国", "com.tencent.lifeH"),
+            ),
+            self._protobuf_field(
+                10, self._oppo_resource_card(37361733, "斗罗大陆:零", "com.tencent.tmgp.osgame"),
+            ),
+            self._protobuf_field(7, "oap://gc/dt?id=99999999"),
+            self._protobuf_field(14, "https://example.com/wrapper-banner.jpg"),
+        ])
+        items = [
+            {"name": "粒粒的小人国", "raw": {}, "tags": []},
+            {"name": "斗罗大陆:零", "raw": {}, "tags": []},
+        ]
+        _attach_oppo_offline_metadata(items, [blob])
+        first = items[0]["raw"]["oppo_offline_detail"]
+        second = items[1]["raw"]["oppo_offline_detail"]
+        self.assertEqual(first["app_id"], "36309165")
+        self.assertEqual(first["package_name"], "com.tencent.lifeH")
+        self.assertEqual(second["app_id"], "37361733")
+        self.assertEqual(second["package_name"], "com.tencent.tmgp.osgame")
+        self.assertEqual(len(first["screenshot_urls"]), 5)
+        self.assertNotIn(first["icon_url"], first["screenshot_urls"])
+        self.assertIn("玩法介绍", items[0]["gameplay_intro"])
+
+    @patch("newgame_monitor.app_cache_collectors._oppo_offline_blobs")
+    def test_oppo_offline_media_backfills_intro_and_gallery(self, offline_blobs):
+        offline_blobs.return_value = [
+            self._oppo_resource_card(36309165, "粒粒的小人国", "com.tencent.lifeH")
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            conn = connect(Path(folder) / "oppo-offline.db")
+            upsert_items(conn, [{
+                "source": "oppo_gamecenter", "source_item_id": "oppo-1",
+                "name": "粒粒的小人国", "event_type": "beta",
+                "event_time": "2026-08-27", "raw": {},
+            }], "2026-08-27T10:00:00+08:00")
+            result = enrich_oppo_offline_media(conn)
+            row = conn.execute(
+                "SELECT package_name,gameplay_intro,detail_url,category,raw_json "
+                "FROM source_items WHERE source='oppo_gamecenter'"
+            ).fetchone()
+            self.assertEqual(result["matched"], 1)
+            self.assertEqual(row["package_name"], "com.tencent.lifeH")
+            self.assertIn("玩法介绍", row["gameplay_intro"])
+            self.assertEqual(row["detail_url"], "oaps://gc/dt?id=36309165")
+            self.assertEqual(row["category"], "角色扮演")
+            self.assertEqual(
+                len(json.loads(row["raw_json"])["oppo_offline_detail"]["screenshot_urls"]), 5,
+            )
+            conn.close()
+
+    def test_oppo_resource_app_id_does_not_require_deep_link(self):
+        item = {"name": "无链接卡片", "raw": {}, "tags": []}
+        blob = self._oppo_resource_card(
+            36969909, "无链接卡片", "ShinchanMatchDaily.nearme.gamecenter",
+            with_link=False,
+        )
+        _attach_oppo_offline_metadata([item], [blob])
+        detail = item["raw"]["oppo_offline_detail"]
+        self.assertEqual(detail["app_id"], "36969909")
+        self.assertEqual(detail["package_name"], "ShinchanMatchDaily.nearme.gamecenter")
+
+    def test_oppo_resource_rejects_app_id_link_mismatch(self):
+        item = {"name": "错配卡片", "raw": {}, "tags": []}
+        blob = self._oppo_resource_card(
+            37361733, "错配卡片", "com.example.mismatch", link_id=36309165,
+        )
+        _attach_oppo_offline_metadata([item], [blob])
+        self.assertNotIn("oppo_offline_detail", item["raw"])
+
+    def test_oppo_same_name_with_different_app_ids_is_ambiguous(self):
+        item = {"name": "同名游戏", "raw": {}, "tags": []}
+        blob = b"".join([
+            self._protobuf_field(
+                10, self._oppo_resource_card(10001, "同名游戏", "com.example.first"),
+            ),
+            self._protobuf_field(
+                10, self._oppo_resource_card(10002, "同名游戏", "com.example.second"),
+            ),
+        ])
+        _attach_oppo_offline_metadata([item], [blob])
+        self.assertNotIn("oppo_offline_detail", item["raw"])
+
+    @patch("newgame_monitor.app_cache_collectors._tap_node")
+    @patch("newgame_monitor.app_cache_collectors._ui_detail_enabled", return_value=False)
+    def test_oppo_beta_does_not_open_detail_without_explicit_backfill(
+        self, _enabled, tap,
+    ):
+        xml = (
+            b'<hierarchy><node resource-id="com.nearme.gamecenter:id/appName" '
+            b'text="beta game" bounds="[0,0][100,100]" /></hierarchy>'
+        )
+        _enrich_visible_oppo_details(
+            xml, [{"name": "beta game", "event_type": "beta", "raw": {}}], set(),
+        )
+        tap.assert_not_called()
+
+    def test_oppo_snapshot_enrichment_preserves_captured_gallery(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conn = connect(Path(folder) / "oppo-snapshot.db")
+            upsert_items(conn, [{
+                "source": "oppo_gamecenter", "source_item_id": "oppo-1",
+                "name": "图集保留测试", "event_type": "beta",
+                "event_time": "2026-08-27", "raw": {
+                    "ui_detail": {"screenshot_urls": [
+                        "local-screenshot://gallery/oppo_gamecenter/sample.webp"
+                    ]},
+                },
+            }], "2026-08-27T10:00:00+08:00")
+            key = hashlib.sha1("图集保留测试".encode()).hexdigest()[:10]
+            path = f"/sdcard/oppo-detail-{key}-expanded.xml"
+            xml = (
+                '<hierarchy><node resource-id="com.nearme.gamecenter:id/introduction_tv" '
+                'text="完整游戏介绍" /></hierarchy>'
+            ).encode("utf-8")
+
+            def fake_adb(*args):
+                return (path + "\n").encode() if args[0] == "shell" else xml
+
+            with patch("newgame_monitor.app_cache_collectors._adb", side_effect=fake_adb):
+                enrich_oppo_ui_snapshots(conn)
+            raw = json.loads(conn.execute(
+                "SELECT raw_json FROM source_items WHERE source_item_id='oppo-1'"
+            ).fetchone()[0])
+            self.assertEqual(raw["ui_detail"]["screenshot_urls"], [
+                "local-screenshot://gallery/oppo_gamecenter/sample.webp"
+            ])
+            conn.close()
+
+    def test_oppo_gallery_captures_local_screenshot_asset(self):
+        root = ET.fromstring("""
+        <hierarchy><node resource-id="com.nearme.gamecenter:id/screenshots_view"
+          class="android.widget.HorizontalScrollView" bounds="[0,600][1440,1400]">
+          <node class="android.widget.ImageView" content-desc="图片"
+            bounds="[64,700][1376,1300]" />
+        </node></hierarchy>
+        """.encode("utf-8"))
+        image = Image.new("RGB", (1440, 2560), (40, 90, 160))
+        buffer = BytesIO()
+        image.save(buffer, "PNG")
+        with tempfile.TemporaryDirectory() as folder, patch.dict(
+            os.environ, {"NEWGAME_ICON_DIR": folder}, clear=False,
+        ), patch(
+            "newgame_monitor.app_cache_collectors._capture_screen",
+            return_value=buffer.getvalue(),
+        ):
+            urls = _capture_oppo_gallery("图集测试游戏", root, max_images=1)
+            relative = urls[0].removeprefix("local-screenshot://")
+            self.assertTrue((Path(folder) / relative).is_file())
+
     def test_ui_dump_retries_transient_adb_failure(self):
         failure = subprocess.CalledProcessError(137, ["adb", "uiautomator", "dump"])
         with patch(

@@ -31,7 +31,12 @@ class SimulatorSyncTest(unittest.TestCase):
                     "icon_url": "local-icon://ui/honor_gamecenter/honor-1.webp",
                     "event_type": "beta",
                     "event_time": "2026-08-22",
-                    "raw": {"evidence": "ui"},
+                    "raw": {
+                        "evidence": "ui",
+                        "ui_detail": {"screenshot_urls": [
+                            "local-screenshot://gallery/oppo_gamecenter/gallery-1.webp"
+                        ]},
+                    },
                 }, {
                     "source": "taptap",
                     "source_item_id": "tap-sync-1",
@@ -57,6 +62,9 @@ class SimulatorSyncTest(unittest.TestCase):
             icon = source_icons / "ui" / "honor_gamecenter" / "honor-1.webp"
             icon.parent.mkdir(parents=True)
             icon.write_bytes(b"fake-webp")
+            gallery = source_icons / "gallery" / "oppo_gamecenter" / "gallery-1.webp"
+            gallery.parent.mkdir(parents=True)
+            gallery.write_bytes(b"fake-gallery-webp")
             raw = source_raw / "2026-08-21" / "honor-ui" / "071500-list.raw"
             raw.parent.mkdir(parents=True)
             raw.write_bytes(b"ui-evidence")
@@ -66,7 +74,7 @@ class SimulatorSyncTest(unittest.TestCase):
                 "2026-08-21T07:00:00+08:00",
             )
             self.assertEqual(result["items"], 2)
-            self.assertEqual(result["icons"], 1)
+            self.assertEqual(result["icons"], 2)
 
             target_db = root / "target.db"
             target_raw = root / "target-raw"
@@ -86,6 +94,9 @@ class SimulatorSyncTest(unittest.TestCase):
             self.assertEqual(imported["items"], 2)
             self.assertEqual(imported["runs"], 4)
             self.assertTrue((target_icons / "ui" / "honor_gamecenter" / "honor-1.webp").is_file())
+            self.assertTrue(
+                (target_icons / "gallery" / "oppo_gamecenter" / "gallery-1.webp").is_file()
+            )
             self.assertTrue((target_raw / "2026-08-21" / "honor-ui" / "071500-list.raw").is_file())
             target = connect(target_db)
             self.assertEqual(target.execute("SELECT COUNT(*) FROM source_items").fetchone()[0], 3)

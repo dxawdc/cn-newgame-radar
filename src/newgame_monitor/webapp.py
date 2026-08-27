@@ -321,12 +321,22 @@ def _game_gallery(game: dict) -> list[dict]:
     assets = game.get("_screenshot_assets") or {}
     gallery = []
     for source, remote_url in gallery_urls_from_rows(ordered_rows):
-        relative = assets.get(remote_url)
+        local_prefix = "local-screenshot://"
+        if remote_url.startswith(local_prefix):
+            relative = remote_url.removeprefix(local_prefix)
+            local_exists = (ICON_DIR / relative).exists()
+            url = f"{BASE_PATH}/icons/{relative}" if local_exists else None
+        else:
+            relative = assets.get(remote_url)
+            local_exists = bool(relative)
+            url = f"{BASE_PATH}/screenshots/{relative}" if relative else remote_url
+        if not url:
+            continue
         gallery.append({
-            "url": f"{BASE_PATH}/screenshots/{relative}" if relative else remote_url,
+            "url": url,
             "source": source,
             "source_label": SOURCE_LABELS.get(source, source),
-            "cached": bool(relative),
+            "cached": local_exists,
         })
         if len(gallery) == 5:
             break
@@ -341,8 +351,30 @@ def _source_payload(source: str) -> dict:
     }
 
 
+def _row_value(row, key: str, default=""):
+    if isinstance(row, dict):
+        return row.get(key, default)
+    return row[key] if key in row.keys() else default
+
+
+def _latest_event_rows(members: Iterable[sqlite3.Row]) -> list[sqlite3.Row]:
+    """同一产品按来源渠道和事件类型仅保留最近观测，允许档期后续推迟。"""
+    latest = {}
+    for row in members:
+        key = (row["source"], _effective_event_type(row))
+        rank = (
+            _row_value(row, "last_seen_at"),
+            _iso_date(_row_value(row, "event_time")),
+            _row_value(row, "id", 0),
+        )
+        current = latest.get(key)
+        if current is None or rank >= current[0]:
+            latest[key] = (rank, row)
+    return [item[1] for item in latest.values()]
+
+
 def _serialize(game: dict, members: Iterable[sqlite3.Row] | None = None) -> dict:
-    selected = list(members if members is not None else game["members"])
+    selected = _latest_event_rows(members if members is not None else game["members"])
     sources = sorted(
         {row["source"] for row in game["members"]},
         key=lambda source: (SOURCE_ORDER.get(source, len(SOURCE_ORDER)), SOURCE_LABELS.get(source, source)),
@@ -399,7 +431,7 @@ def _serialize(game: dict, members: Iterable[sqlite3.Row] | None = None) -> dict
 
 def _catalog_entries_for_game(game: dict, members: Iterable[sqlite3.Row], view_mode: str) -> list[dict]:
     """把渠道原子事件投影为产品聚合或渠道明细列表项。"""
-    scoped = list(members)
+    scoped = _latest_event_rows(members)
     if view_mode == "channel":
         entries = []
         seen = set()
@@ -1161,13 +1193,15 @@ def summary(
         )
         for period in ("day", "week", "month", "all")
     }
+    event_count = len(_filtered_games(
+        "all", event_types=set(EVENT_LABELS), view_mode="channel",
+    ))
     conn = _conn()
     try:
         last = conn.execute(
             "SELECT finished_at FROM collection_runs WHERE status='success' ORDER BY finished_at DESC LIMIT 1"
         ).fetchone()
         source_count = conn.execute("SELECT COUNT(DISTINCT source) FROM source_items").fetchone()[0]
-        event_count = conn.execute("SELECT COUNT(*) FROM source_items").fetchone()[0]
     finally:
         conn.close()
     return {

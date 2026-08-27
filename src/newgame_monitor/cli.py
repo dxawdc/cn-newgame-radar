@@ -106,9 +106,12 @@ def main() -> int:
         summary["oppo_offline_media"] = {
             "status": "success", **enrich_oppo_offline_media(conn)
         }
-        summary["oppo_ui_snapshots"] = {
-            "status": "success", **enrich_oppo_ui_snapshots(conn)
-        }
+        # 历史 /sdcard 快照不得在日常采集中冒充本轮详情。
+        # 只有显式逐项回填时才读取；正常路径使用 ResourceDto 原图。
+        if args.ui_details:
+            summary["oppo_ui_snapshots"] = {
+                "status": "success", **enrich_oppo_ui_snapshots(conn)
+            }
     summary["name_fallback"] = {
         "status": "success", **enrich_name_lookup_fallback(conn)
     }

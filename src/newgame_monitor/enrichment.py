@@ -1357,7 +1357,9 @@ def enrich_oppo_ui_snapshots(conn: sqlite3.Connection) -> dict:
             raw = json.loads(row["raw_json"] or "{}")
         except json.JSONDecodeError:
             raw = {}
+        existing_detail = raw.get("ui_detail") if isinstance(raw.get("ui_detail"), dict) else {}
         raw["ui_detail"] = {
+            **existing_detail,
             "name": row["name"], "description": description,
             "source": "oppo_gamecenter_app_snapshot",
             "captured_at": datetime.now().astimezone().isoformat(),
@@ -1382,17 +1384,17 @@ def enrich_oppo_ui_snapshots(conn: sqlite3.Connection) -> dict:
 
 
 def enrich_oppo_offline_media(conn: sqlite3.Connection) -> dict:
-    """从 OPPO 已登录 App 的公开离线响应回填可归属到具体游戏的商店截图。"""
+    """从 OPPO 公开 ResourceDto 缓存回填身份、简介和商店原图。"""
     from .app_cache_collectors import _attach_oppo_offline_metadata, _oppo_offline_blobs
 
     rows = list(conn.execute(
-        "SELECT id,name,package_name,icon_url,raw_json FROM source_items "
-        "WHERE source='oppo_gamecenter'"
+        "SELECT id,name,package_name,icon_url,gameplay_intro,detail_url,category,raw_json "
+        "FROM source_items WHERE source='oppo_gamecenter'"
     ))
     blobs = _oppo_offline_blobs()
     if not blobs:
         return {"available": False, "checked": len(rows), "matched": 0, "updated": 0}
-    items = [{"name": row["name"], "raw": {}} for row in rows]
+    items = [{"name": row["name"], "raw": {}, "tags": []} for row in rows]
     _attach_oppo_offline_metadata(items, blobs)
     updated = matched = 0
     for row, item in zip(rows, items):
@@ -1409,9 +1411,13 @@ def enrich_oppo_offline_media(conn: sqlite3.Connection) -> dict:
         raw["oppo_offline_detail"] = merged
         conn.execute(
             "UPDATE source_items SET package_name=COALESCE(NULLIF(package_name,''),?), "
-            "icon_url=COALESCE(NULLIF(icon_url,''),?), raw_json=? WHERE id=?",
+            "icon_url=COALESCE(NULLIF(icon_url,''),?), "
+            "gameplay_intro=COALESCE(NULLIF(gameplay_intro,''),?), "
+            "detail_url=COALESCE(NULLIF(detail_url,''),?), "
+            "category=COALESCE(NULLIF(category,''),?), raw_json=? WHERE id=?",
             (
                 detail.get("package_name"), detail.get("icon_url"),
+                detail.get("brief"), detail.get("detail_url"), detail.get("category"),
                 json.dumps(raw, ensure_ascii=False, separators=(",", ":")), row["id"],
             ),
         )

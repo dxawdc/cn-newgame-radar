@@ -50,6 +50,21 @@ def _safe_member_path(name: str) -> PurePosixPath:
     return path
 
 
+def _local_screenshot_paths(value) -> set[str]:
+    """递归读取记录中由模拟器截取、需要随增量包同步的本地图集。"""
+    prefix = "local-screenshot://"
+    found: set[str] = set()
+    if isinstance(value, str) and value.startswith(prefix):
+        found.add(value[len(prefix):])
+    elif isinstance(value, dict):
+        for child in value.values():
+            found.update(_local_screenshot_paths(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.update(_local_screenshot_paths(child))
+    return found
+
+
 def export_bundle(
     db_path: Path,
     raw_dir: Path,
@@ -116,19 +131,25 @@ def export_bundle(
 
         for item in items:
             icon_url = item.get("icon_url") or ""
+            local_paths = set()
             prefix = "local-icon://"
-            if not icon_url.startswith(prefix):
-                continue
-            relative = PurePosixPath(icon_url[len(prefix):])
-            if relative.is_absolute() or ".." in relative.parts:
-                continue
-            relative_text = relative.as_posix()
-            if relative_text in included_icons:
-                continue
-            source_path = icon_dir.joinpath(*relative.parts)
-            if source_path.is_file() and _is_within(source_path, icon_dir):
-                archive.add(source_path, arcname=f"icons/{relative_text}", recursive=False)
-                included_icons.add(relative_text)
+            if icon_url.startswith(prefix):
+                local_paths.add(icon_url[len(prefix):])
+            try:
+                local_paths.update(_local_screenshot_paths(json.loads(item.get("raw_json") or "{}")))
+            except json.JSONDecodeError:
+                pass
+            for local_path in local_paths:
+                relative = PurePosixPath(local_path)
+                if relative.is_absolute() or ".." in relative.parts:
+                    continue
+                relative_text = relative.as_posix()
+                if relative_text in included_icons:
+                    continue
+                source_path = icon_dir.joinpath(*relative.parts)
+                if source_path.is_file() and _is_within(source_path, icon_dir):
+                    archive.add(source_path, arcname=f"icons/{relative_text}", recursive=False)
+                    included_icons.add(relative_text)
 
         if raw_dir.is_dir():
             for source_path in raw_dir.rglob("*"):

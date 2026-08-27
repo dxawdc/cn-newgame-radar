@@ -26,7 +26,7 @@ def _relative_path(url: str) -> Path:
 
 def _url(value: Any) -> str | None:
     if isinstance(value, str):
-        return value if value.startswith(("https://", "http://")) else None
+        return value if value.startswith(("https://", "http://", "local-screenshot://")) else None
     if isinstance(value, dict):
         for key in ("url", "medium_url", "original_url", "imageUrl", "imgUrl"):
             result = _url(value.get(key))
@@ -116,6 +116,8 @@ def extract_gallery_urls(source: str, raw_value: str | dict | None) -> list[str]
     elif source == "oppo_gamecenter":
         detail = raw.get("oppo_offline_detail") or {}
         candidates.extend(_urls(detail.get("screenshot_urls")))
+        ui_detail = raw.get("ui_detail") or {}
+        candidates.extend(_urls(ui_detail.get("screenshot_urls")))
 
     return list(dict.fromkeys(candidates))[:10]
 
@@ -206,7 +208,10 @@ def cache_remote_screenshots(
                 """,
                 discovered,
             )
-    pending = sorted(urls - set(successful))
+    pending = sorted(
+        url for url in urls - set(successful)
+        if url.startswith(("https://", "http://"))
+    )
     results = []
     if pending:
         with ThreadPoolExecutor(max_workers=workers) as pool:

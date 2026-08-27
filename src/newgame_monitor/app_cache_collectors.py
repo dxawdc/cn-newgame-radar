@@ -19,6 +19,12 @@ from PIL import Image, ImageStat
 
 SERIAL = os.environ.get("NEWGAME_ADB_SERIAL", "127.0.0.1:16384")
 
+_OPPO_RESOURCE_MARKER = (
+    b"\xfa\x07\x2ccom.heytap.cdo.common.domain.dto.ResourceDto"
+)
+_OPPO_DETAIL_LINK = re.compile(rb"oap://gc/dt\?id=(\d+)")
+_OPPO_OFFLINE_BLOB_CACHE: dict[str, tuple[str, bytes | None]] = {}
+
 
 def _adb_path() -> Path:
     configured = os.environ.get("NEWGAME_ADB")
@@ -314,6 +320,79 @@ def _clean_ui_text(value: str | None) -> str | None:
     return text or None
 
 
+def _capture_oppo_gallery(expected_name: str, root, *, max_images: int = 5) -> list[str]:
+    """从 OPPO 详情页的横向图集控件截取可见媒体，并保存为可同步的本地资源。"""
+    icon_root = Path(os.environ.get("NEWGAME_ICON_DIR", "data/icons"))
+    target_root = icon_root / "gallery" / "oppo_gamecenter"
+    target_root.mkdir(parents=True, exist_ok=True)
+    name_hash = hashlib.sha1(expected_name.encode("utf-8")).hexdigest()[:12]
+    urls: list[str] = []
+    seen: set[str] = set()
+    stable = 0
+    current_root = root
+    for index in range(max_images):
+        gallery = next(
+            (
+                item for item in current_root.iter("node")
+                if item.get("resource-id", "").endswith("/screenshots_view")
+            ),
+            None,
+        )
+        if gallery is None:
+            break
+        candidates = [
+            item for item in gallery.iter("node")
+            if item.get("class") == "android.widget.ImageView"
+            and item.get("content-desc") in {"图片", "视频"}
+            and (_bounds(item)[2] - _bounds(item)[0]) >= 240
+            and (_bounds(item)[3] - _bounds(item)[1]) >= 160
+        ]
+        if not candidates:
+            break
+        image_node = max(
+            candidates,
+            key=lambda item: (
+                (_bounds(item)[2] - _bounds(item)[0])
+                * (_bounds(item)[3] - _bounds(item)[1])
+            ),
+        )
+        left, top, right, bottom = _bounds(image_node)
+        try:
+            screen = Image.open(BytesIO(_capture_screen())).convert("RGB")
+            crop = screen.crop((
+                max(0, left), max(0, top), min(screen.width, right), min(screen.height, bottom),
+            ))
+        except Exception:
+            break
+        if crop.width < 240 or crop.height < 160:
+            break
+        digest = hashlib.sha256(crop.resize((32, 32)).tobytes()).hexdigest()
+        if digest in seen:
+            stable += 1
+        else:
+            stable = 0
+            seen.add(digest)
+            filename = f"{name_hash}-{digest[:16]}.webp"
+            target = target_root / filename
+            if not target.exists():
+                crop.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+                crop.save(target, "WEBP", quality=84, method=4)
+            urls.append(f"local-screenshot://gallery/oppo_gamecenter/{filename}")
+        if stable >= 2 or index >= max_images - 1:
+            break
+        gallery_left, gallery_top, gallery_right, gallery_bottom = _bounds(gallery)
+        _adb(
+            "shell", "input", "swipe",
+            str(max(gallery_left + 120, gallery_right - 160)),
+            str((gallery_top + gallery_bottom) // 2),
+            str(min(gallery_right - 120, gallery_left + 160)),
+            str((gallery_top + gallery_bottom) // 2), "450",
+        )
+        time.sleep(0.7)
+        current_root = ET.fromstring(_dump_ui(f"oppo-detail-{name_hash}-gallery-{index + 1}"))
+    return urls
+
+
 def _capture_honor_detail(expected_name: str) -> dict:
     """从当前荣耀详情页读取公开展示字段。"""
     result: dict = {"name": expected_name, "tags": []}
@@ -351,6 +430,8 @@ def _capture_oppo_detail(expected_name: str) -> dict:
         if index == 0 and actual_name and actual_name != expected_name:
             raise ValueError(f"OPPO 详情名称不匹配：{expected_name} != {actual_name}")
         result["tags"] = list(dict.fromkeys([*result["tags"], *_texts_by_suffix(root, "tv_tag_name")]))
+        if not result.get("screenshot_urls"):
+            result["screenshot_urls"] = _capture_oppo_gallery(expected_name, root)
         intro_node = next(
             (item for item in root.iter("node") if item.get("resource-id", "").endswith("/introduction_tv")),
             None,
@@ -392,27 +473,181 @@ def _merge_ui_detail(item: dict, detail: dict, *, source: str) -> None:
     }
 
 
+def _oppo_network_response_data(blob: bytes) -> bytes | None:
+    """从 Java 序列化的 NetworkResponse 中取出业务响应 byte[]。"""
+    if not blob.startswith(b"\xac\xed\x00\x05"):
+        return None
+    if b"com.nearme.network.internal.NetworkResponse" not in blob:
+        return None
+    marker = b"\x75\x72\x00\x02[B"
+    candidates: list[bytes] = []
+    offset = 0
+    while True:
+        start = blob.find(marker, offset)
+        if start < 0:
+            break
+        class_end = blob.find(b"\x78\x70", start + len(marker), start + 96)
+        if class_end >= 0 and class_end + 6 <= len(blob):
+            size = int.from_bytes(blob[class_end + 2:class_end + 6], "big")
+            data_start = class_end + 6
+            if 0 < size <= len(blob) - data_start:
+                candidates.append(blob[data_start:data_start + size])
+        offset = start + len(marker)
+    if len(candidates) != 1 or _OPPO_RESOURCE_MARKER not in candidates[0]:
+        return None
+    return candidates[0]
+
+
 def _oppo_offline_blobs() -> list[bytes]:
     try:
+        base = "/data/data/com.nearme.gamecenter/files/cache/offline/*.0"
         paths = _adb(
-            "shell", "su -c \"find /data/data/com.nearme.gamecenter/files/cache/offline "
-            "-type f -name '*.0' 2>/dev/null\""
+            "shell", f"su -c \"ls -1t {base} 2>/dev/null\""
+        ).decode("utf-8", errors="ignore").splitlines()
+        manifest = _adb(
+            "shell", f"su -c \"sha256sum {base} 2>/dev/null\""
         ).decode("utf-8", errors="ignore").splitlines()
     except (OSError, subprocess.SubprocessError):
         return []
-    blobs = []
-    for path in paths:
+    hashes = {}
+    for line in manifest:
+        match = re.fullmatch(r"([0-9a-fA-F]{64})\s+(.+\.0)", line.strip())
+        if match:
+            hashes[match.group(2)] = match.group(1).lower()
+    entries = [(path, hashes[path]) for path in paths if path in hashes]
+    active_paths = set(paths)
+    for stale_path in set(_OPPO_OFFLINE_BLOB_CACHE) - active_paths:
+        _OPPO_OFFLINE_BLOB_CACHE.pop(stale_path, None)
+    blobs: list[bytes] = []
+    for path, digest in entries:
         try:
-            blobs.append(_read_root_file(path))
+            cached = _OPPO_OFFLINE_BLOB_CACHE.get(path)
+            if cached is None or cached[0] != digest:
+                raw = _read_root_file(path)
+                payload = _oppo_network_response_data(raw)
+                _OPPO_OFFLINE_BLOB_CACHE[path] = (digest, payload)
+            payload = _OPPO_OFFLINE_BLOB_CACHE[path][1]
+            if payload is not None:
+                blobs.append(payload)
         except (OSError, subprocess.SubprocessError):
             continue
     return blobs
 
 
+def _read_protobuf_varint(blob: bytes, offset: int, end: int) -> tuple[int, int] | None:
+    value = 0
+    shift = 0
+    while offset < end and shift <= 63:
+        byte = blob[offset]
+        offset += 1
+        value |= (byte & 0x7f) << shift
+        if not byte & 0x80:
+            return value, offset
+        shift += 7
+    return None
+
+
+def _parse_protobuf_message(
+    blob: bytes, start: int = 0, end: int | None = None,
+) -> tuple[dict[int, list[int | bytes]], list[tuple[int, int, int]]] | None:
+    """严格解析一个 protobuf 消息，同时保留 length-delimited 子区间。"""
+    fields: dict[int, list[int | bytes]] = {}
+    children: list[tuple[int, int, int]] = []
+    cursor = start
+    end = len(blob) if end is None else end
+    while cursor < end:
+        parsed_tag = _read_protobuf_varint(blob, cursor, end)
+        if parsed_tag is None:
+            return None
+        tag, cursor = parsed_tag
+        field_number, wire_type = tag >> 3, tag & 7
+        if field_number == 0 or field_number >= 1 << 29:
+            return None
+        if wire_type == 0:
+            parsed_value = _read_protobuf_varint(blob, cursor, end)
+            if parsed_value is None:
+                return None
+            value, cursor = parsed_value
+        elif wire_type == 1:
+            if cursor + 8 > end:
+                return None
+            value, cursor = blob[cursor:cursor + 8], cursor + 8
+        elif wire_type == 2:
+            parsed_size = _read_protobuf_varint(blob, cursor, end)
+            if parsed_size is None:
+                return None
+            size, data_start = parsed_size
+            data_end = data_start + size
+            if data_end > end:
+                return None
+            value, cursor = blob[data_start:data_end], data_end
+            children.append((field_number, data_start, data_end))
+        elif wire_type == 5:
+            if cursor + 4 > end:
+                return None
+            value, cursor = blob[cursor:cursor + 4], cursor + 4
+        else:
+            return None
+        fields.setdefault(field_number, []).append(value)
+    if cursor != end or not fields:
+        return None
+    return fields, children
+
+
+def _oppo_resource_fields(segment: bytes) -> dict[int, list[int | bytes]]:
+    """解析一张已精确切边的 ResourceDto 顶层字段。"""
+    parsed = _parse_protobuf_message(segment)
+    if parsed is None:
+        return {}
+    fields, _ = parsed
+    marker_values = fields.get(127, [])
+    if not marker_values or marker_values[0] != b"com.heytap.cdo.common.domain.dto.ResourceDto":
+        return {}
+    return fields
+
+
+def _oppo_resource_records(blob: bytes) -> list[dict[int, list[int | bytes]]]:
+    """递归找到最小 ResourceDto 子消息，不读取相邻 wrapper 字段。"""
+    found: list[dict[int, list[int | bytes]]] = []
+
+    def visit(start: int, end: int, depth: int) -> None:
+        parsed = _parse_protobuf_message(blob, start, end)
+        if parsed is None:
+            return
+        fields, children = parsed
+        marker_values = fields.get(127, [])
+        if marker_values and marker_values[0] == b"com.heytap.cdo.common.domain.dto.ResourceDto":
+            found.append(fields)
+            return
+        if depth >= 16:
+            return
+        for _, child_start, child_end in children:
+            if _OPPO_RESOURCE_MARKER not in blob[child_start:child_end]:
+                continue
+            visit(child_start, child_end, depth + 1)
+
+    visit(0, len(blob), 0)
+    return found
+
+
+def _oppo_field_texts(fields: dict[int, list[int | bytes]], field_number: int) -> list[str]:
+    values = []
+    for raw in fields.get(field_number, []):
+        if not isinstance(raw, bytes):
+            continue
+        try:
+            value = raw.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            continue
+        if value:
+            values.append(value)
+    return values
+
+
 def _oppo_screenshot_urls(blob: bytes, name_end: int) -> list[str]:
     """读取当前游戏名之后、下一张游戏卡之前的连续商店截图 URL。"""
     tail = blob[name_end:name_end + 12000]
-    next_card = re.search(rb"oap://gc/dt\?id=\d+", tail)
+    next_card = _OPPO_DETAIL_LINK.search(tail)
     if next_card:
         tail = tail[:next_card.start()]
     matches = list(re.finditer(
@@ -441,40 +676,80 @@ def _oppo_screenshot_urls(blob: bytes, name_end: int) -> list[str]:
 
 
 def _attach_oppo_offline_metadata(items: list[dict], blobs: list[bytes] | None = None) -> None:
-    """从 OPPO App 正常产生的公开离线响应补包名、Icon 和详情 ID。"""
+    """从 OPPO App 的 ResourceDto 响应补包名、简介、Icon、图集和详情 ID。"""
     if not items:
         return
     blobs = _oppo_offline_blobs() if blobs is None else blobs
+    cards_by_name: dict[str, dict] = {}
+    ambiguous_names: set[str] = set()
+    for blob in blobs:  # blobs 已按缓存时间倒序，优先使用最新卡片。
+        for fields in _oppo_resource_records(blob):
+            app_ids = [value for value in fields.get(1, []) if isinstance(value, int) and value > 0]
+            names = list(dict.fromkeys([
+                *_oppo_field_texts(fields, 3), *_oppo_field_texts(fields, 52),
+            ]))
+            if len(app_ids) != 1 or not names:
+                continue
+            app_id = app_ids[0]
+            detail_ids = []
+            for values in fields.values():
+                for value in values:
+                    if not isinstance(value, bytes):
+                        continue
+                    detail_ids.extend(int(match.group(1)) for match in _OPPO_DETAIL_LINK.finditer(value))
+            detail_ids = list(dict.fromkeys(detail_ids))
+            if len(detail_ids) > 1:
+                continue
+            if detail_ids and detail_ids[0] != app_id:
+                continue
+            screenshots = list(dict.fromkeys(
+                value for value in _oppo_field_texts(fields, 32)
+                if value.startswith("https://")
+                if re.search(r"\.(?:png|jpe?g|webp)(?:\?|$)", value, re.IGNORECASE)
+            ))[:10]
+            package_names = _oppo_field_texts(fields, 7)
+            icon_urls = [
+                value for value in _oppo_field_texts(fields, 14)
+                if value.startswith("https://")
+            ]
+            briefs = _oppo_field_texts(fields, 26)
+            categories = _oppo_field_texts(fields, 30)
+            card = {
+                "package_name": package_names[0] if package_names else None,
+                "app_id": str(app_id),
+                "detail_url": f"oaps://gc/dt?id={app_id}",
+                "deep_link": f"oap://gc/dt?id={app_id}" if detail_ids else None,
+                "icon_url": icon_urls[0] if icon_urls else None,
+                "screenshot_urls": screenshots,
+                "brief": briefs[0] if briefs else None,
+                "category": categories[0] if categories else None,
+                "parser": "resource-dto-fields-v1",
+                "confidence": "strict",
+            }
+            for name in names:
+                if name in ambiguous_names:
+                    continue
+                existing = cards_by_name.get(name)
+                if existing is None:
+                    cards_by_name[name] = card
+                elif existing["app_id"] == card["app_id"]:
+                    for key, value in card.items():
+                        if not existing.get(key) and value:
+                            existing[key] = value
+                else:
+                    cards_by_name.pop(name, None)
+                    ambiguous_names.add(name)
     for item in items:
-        needle = item["name"].encode("utf-8")
-        matched = None
-        for blob in blobs:
-            for occurrence in re.finditer(re.escape(needle), blob):
-                before = blob[max(0, occurrence.start() - 2000):occurrence.start()]
-                after = blob[occurrence.end():occurrence.end() + 1800]
-                packages = re.findall(
-                    rb"(?:com\.|cn\.)[a-zA-Z0-9_.]{5,140}\.nearme\.gamecenter",
-                    after[:600],
-                )
-                detail_ids = re.findall(rb"oap://gc/dt\?id=(\d+)", before)
-                icons = re.findall(
-                    rb"https://[^\x00-\x20]{5,300}\.(?:png|jpg|jpeg|webp)", after,
-                )
-                if packages and detail_ids:
-                    screenshots = _oppo_screenshot_urls(blob, occurrence.end())
-                    matched = {
-                        "package_name": packages[0].decode("ascii", errors="ignore"),
-                        "app_id": detail_ids[-1].decode("ascii"),
-                        "icon_url": icons[0].decode("utf-8", errors="ignore") if icons else None,
-                        "screenshot_urls": screenshots,
-                    }
-                    break
-            if matched:
-                break
+        matched = cards_by_name.get(item["name"])
         if not matched:
             continue
         item["package_name"] = item.get("package_name") or matched["package_name"]
         item["icon_url"] = item.get("icon_url") or matched["icon_url"]
+        item["detail_url"] = item.get("detail_url") or matched["detail_url"]
+        item["gameplay_intro"] = item.get("gameplay_intro") or matched["brief"]
+        item["category"] = item.get("category") or matched["category"]
+        if matched["category"]:
+            item["tags"] = list(dict.fromkeys([*item.get("tags", []), matched["category"]]))
         item.setdefault("raw", {})["oppo_offline_detail"] = {
             key: value for key, value in matched.items() if value
         }
@@ -961,6 +1236,7 @@ def _enrich_visible_oppo_details(xml: bytes, items: list[dict], detail_seen: set
     ]
     for node in candidates:
         name = node.get("text").strip()
+        item = by_name[name]
         if name in detail_seen or not _ui_detail_enabled("oppo_gamecenter", name):
             continue
         detail_seen.add(name)
@@ -968,9 +1244,9 @@ def _enrich_visible_oppo_details(xml: bytes, items: list[dict], detail_seen: set
             _tap_node(node)
             time.sleep(2.5)
             detail = _capture_oppo_detail(name)
-            _merge_ui_detail(by_name[name], detail, source="oppo_gamecenter_app")
+            _merge_ui_detail(item, detail, source="oppo_gamecenter_app")
         except (OSError, subprocess.SubprocessError, ET.ParseError, ValueError) as exc:
-            by_name[name].setdefault("raw", {})["ui_detail_error"] = str(exc)[:300]
+            item.setdefault("raw", {})["ui_detail_error"] = str(exc)[:300]
         finally:
             _adb("shell", "input", "keyevent", "4")
             time.sleep(1.2)
@@ -981,13 +1257,12 @@ def _collect_oppo_timeline(
 ) -> tuple[list[dict], list[tuple[str, bytes]]]:
     found, raws, stable, current_date = {}, [], 0, ""
     detail_seen = detail_seen if detail_seen is not None else set()
-    offline_blobs: list[bytes] | None = None
     for index in range(9):
         xml = _dump_ui(f"oppo-{prefix}-{index}")
         raws.append((f"{prefix}-{index}", xml))
         items, current_date = _parse_oppo_timeline(xml, event_type, current_date)
-        if offline_blobs is None:
-            offline_blobs = _oppo_offline_blobs()
+        # OPPO 在滚动后才会落新卡片缓存；内部按路径去重，只读新增文件。
+        offline_blobs = _oppo_offline_blobs()
         _attach_oppo_offline_metadata(items, offline_blobs)
         _attach_ui_icons(
             xml, _capture_screen(), items, source="oppo_gamecenter",
