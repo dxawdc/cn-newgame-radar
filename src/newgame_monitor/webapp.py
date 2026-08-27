@@ -60,6 +60,7 @@ BASE_PATH = "/" + os.environ.get("NEWGAME_BASE_PATH", "").strip("/") if os.envir
 SESSION_COOKIE = "newgame_session"
 COOKIE_PATH = BASE_PATH or "/"
 COOKIE_SECURE = os.environ.get("NEWGAME_COOKIE_SECURE", "0") == "1"
+GAME_ID_REDIRECT_MAX_HOPS = 16
 ICON_DIR.mkdir(parents=True, exist_ok=True)
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 mimetypes.add_type("image/webp", ".webp")
@@ -302,6 +303,40 @@ def _load_catalog(conn: sqlite3.Connection) -> list[dict]:
     return list(games.values())
 
 
+def _resolve_game_id(
+    conn: sqlite3.Connection,
+    requested_id: int,
+    *,
+    existing_ids: set[int] | None = None,
+) -> int | None:
+    """把已删除的旧产品 ID 安全解析到当前产品，遇到断链、环或超长链则失败。"""
+    if existing_ids is None:
+        existing_ids = {
+            row["id"] for row in conn.execute("SELECT id FROM canonical_games")
+        }
+    current_id = requested_id
+    seen: set[int] = set()
+    for hop in range(GAME_ID_REDIRECT_MAX_HOPS + 1):
+        if current_id in seen:
+            return None
+        seen.add(current_id)
+        if current_id in existing_ids:
+            return current_id
+        if hop == GAME_ID_REDIRECT_MAX_HOPS:
+            return None
+        redirect = conn.execute(
+            "SELECT new_game_id FROM canonical_game_id_redirects WHERE old_game_id=?",
+            (current_id,),
+        ).fetchone()
+        if not redirect:
+            return None
+        try:
+            current_id = int(redirect["new_game_id"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _game_gallery(game: dict) -> list[dict]:
     def media_count(row) -> int:
         try:
@@ -358,13 +393,14 @@ def _row_value(row, key: str, default=""):
 
 
 def _latest_event_rows(members: Iterable[sqlite3.Row]) -> list[sqlite3.Row]:
-    """同一产品按来源渠道和事件类型仅保留最近观测，允许档期后续推迟。"""
+    """同一产品按来源渠道和原始事件类型仅保留最近观测，允许档期调整。"""
     latest = {}
     for row in members:
-        key = (row["source"], _effective_event_type(row))
+        # 业务主键使用采集器给出的原始事件类型。空日期只是该事件尚未定档，
+        # 不能因此拆成 first_seen 与原事件两条产品记录。
+        key = (row["source"], row["event_type"])
         rank = (
             _row_value(row, "last_seen_at"),
-            _iso_date(_row_value(row, "event_time")),
             _row_value(row, "id", 0),
         )
         current = latest.get(key)
@@ -567,13 +603,16 @@ def _filtered_games(
             continue
         if developers and (game["developer"] or "") not in developers:
             continue
-        selected = []
-        for row in game["members"]:
-            if sources and row["source"] not in sources:
-                continue
-            if event_types and _effective_event_type(row) not in event_types:
-                continue
-            selected.append(row)
+        source_scoped = [
+            row for row in game["members"]
+            if not sources or row["source"] in sources
+        ]
+        # 必须先按原始事件主键选出当前版本，再投影/筛选 first_seen；否则显式
+        # 查询 first_seen 会把已经被定档记录取代的旧空日期版本重新捞出来。
+        selected = [
+            row for row in _latest_event_rows(source_scoped)
+            if not event_types or _effective_event_type(row) in event_types
+        ]
         if selected:
             # 日期筛选必须发生在聚合之后，否则范围起点会被误当作“最早渠道日期”。
             for entry in _catalog_entries_for_game(game, selected, view_mode):
@@ -781,9 +820,12 @@ def favorite_logs(request: Request, limit: int = Query(default=50, ge=1, le=200)
     try:
         rows = conn.execute(
             """
-            SELECT l.game_key, l.action, l.occurred_at, g.name
+            SELECT COALESCE(r.new_key,l.game_key) AS game_key,
+              l.game_key AS original_game_key, l.action, l.occurred_at, g.name
             FROM favorite_activity_logs l
-            LEFT JOIN canonical_games g ON g.canonical_key=l.game_key
+            LEFT JOIN canonical_key_redirects r ON r.old_key=l.game_key
+            LEFT JOIN canonical_games g
+              ON g.canonical_key=COALESCE(r.new_key,l.game_key)
             WHERE l.user_id=? ORDER BY l.occurred_at DESC, l.id DESC LIMIT ?
             """,
             (context["user"]["id"], limit),
@@ -956,15 +998,23 @@ def add_favorite(payload: FavoritePayload, request: Request):
     _require_csrf(request, context)
     conn = _conn()
     try:
+        game_key = payload.game_key
+        for _ in range(5):
+            redirect = conn.execute(
+                "SELECT new_key FROM canonical_key_redirects WHERE old_key=?", (game_key,)
+            ).fetchone()
+            if not redirect or redirect[0] == game_key:
+                break
+            game_key = redirect[0]
         exists = conn.execute(
-            "SELECT 1 FROM canonical_games WHERE canonical_key=?", (payload.game_key,)
+            "SELECT 1 FROM canonical_games WHERE canonical_key=?", (game_key,)
         ).fetchone()
         if not exists:
             raise HTTPException(status_code=404, detail="游戏不存在")
         followed_at = now_iso()
         existing = conn.execute(
             "SELECT 1 FROM user_favorites WHERE user_id=? AND game_key=?",
-            (context["user"]["id"], payload.game_key),
+            (context["user"]["id"], game_key),
         ).fetchone()
         if not existing:
             conn.execute(
@@ -972,14 +1022,14 @@ def add_favorite(payload: FavoritePayload, request: Request):
                 INSERT INTO user_favorites(user_id, game_key, created_at, last_followed_at)
                 VALUES (?, ?, ?, ?)
                 """,
-                (context["user"]["id"], payload.game_key, followed_at, followed_at),
+                (context["user"]["id"], game_key, followed_at, followed_at),
             )
             conn.execute(
                 """
                 INSERT INTO favorite_activity_logs(user_id, game_key, action, occurred_at)
                 VALUES (?, ?, 'follow', ?)
                 """,
-                (context["user"]["id"], payload.game_key, followed_at),
+                (context["user"]["id"], game_key, followed_at),
             )
         conn.commit()
         count = conn.execute(
@@ -987,7 +1037,7 @@ def add_favorite(payload: FavoritePayload, request: Request):
         ).fetchone()[0]
         current = conn.execute(
             "SELECT last_followed_at FROM user_favorites WHERE user_id=? AND game_key=?",
-            (context["user"]["id"], payload.game_key),
+            (context["user"]["id"], game_key),
         ).fetchone()
         return {
             "followed": True, "favorite_count": count,
@@ -1003,6 +1053,13 @@ def remove_favorite(game_key: str, request: Request):
     _require_csrf(request, context)
     conn = _conn()
     try:
+        for _ in range(5):
+            redirect = conn.execute(
+                "SELECT new_key FROM canonical_key_redirects WHERE old_key=?", (game_key,)
+            ).fetchone()
+            if not redirect or redirect[0] == game_key:
+                break
+            game_key = redirect[0]
         cursor = conn.execute(
             "DELETE FROM user_favorites WHERE user_id=? AND game_key=?",
             (context["user"]["id"], game_key),
@@ -1167,7 +1224,10 @@ def game_detail(game_id: int, request: Request):
     favorite_dates = _favorite_dates(context["user"]["id"]) if context else {}
     conn = _conn()
     try:
-        game = next((item for item in _load_catalog(conn) if item["id"] == game_id), None)
+        catalog = _load_catalog(conn)
+        games_by_id = {item["id"]: item for item in catalog}
+        resolved_id = _resolve_game_id(conn, game_id, existing_ids=set(games_by_id))
+        game = games_by_id.get(resolved_id) if resolved_id is not None else None
         if not game:
             return {"error": "not_found"}
         payload = _serialize(game)

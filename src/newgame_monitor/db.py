@@ -71,6 +71,29 @@ CREATE TABLE IF NOT EXISTS canonical_members (
 CREATE INDEX IF NOT EXISTS idx_canonical_members_source ON canonical_members(source_row_id);
 CREATE INDEX IF NOT EXISTS idx_canonical_games_name ON canonical_games(name);
 
+CREATE TABLE IF NOT EXISTS canonical_key_redirects (
+    old_key TEXT PRIMARY KEY,
+    new_key TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_canonical_key_redirects_new
+ON canonical_key_redirects(new_key);
+
+CREATE TABLE IF NOT EXISTS canonical_game_id_redirects (
+    old_game_id INTEGER PRIMARY KEY,
+    new_game_id INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    CHECK (old_game_id > 0),
+    CHECK (new_game_id > 0),
+    CHECK (old_game_id <> new_game_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_canonical_game_id_redirects_new
+ON canonical_game_id_redirects(new_game_id);
+
 CREATE TABLE IF NOT EXISTS icon_assets (
     source_url TEXT PRIMARY KEY,
     relative_path TEXT,
@@ -212,6 +235,10 @@ def connect(path: Path) -> sqlite3.Connection:
 
 
 def upsert_items(conn: sqlite3.Connection, items: list[dict], observed_at: str) -> int:
+    # 每条来源记录在写入时先生成保守的名称标准键；全量结构化变体归并由
+    # rebuild_catalog 在掌握所有产品名称后统一完成。
+    from .catalog import canonical_key_for
+
     sql = """
     INSERT INTO source_items (
         source, source_item_id, name, package_name, developer, category,
@@ -259,6 +286,7 @@ def upsert_items(conn: sqlite3.Connection, items: list[dict], observed_at: str) 
             "first_seen_at": observed_at,
             "last_seen_at": observed_at,
         }
+        row["canonical_key"] = canonical_key_for(row["name"], row["package_name"])
         row["tags_json"] = json.dumps(row.pop("tags", []), ensure_ascii=False)
         row["raw_json"] = json.dumps(row.pop("raw", {}), ensure_ascii=False, separators=(",", ":"))
         conn.execute(sql, row)

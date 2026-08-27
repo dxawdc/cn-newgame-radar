@@ -2,6 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from starlette.requests import Request
+
 from newgame_monitor import webapp
 from newgame_monitor.catalog import rebuild_catalog
 from newgame_monitor.db import connect, upsert_items
@@ -159,6 +161,90 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(result["source_label"], "华为游戏中心")
 
 
+class GameIdRedirectTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.original_db = webapp.DB_PATH
+        webapp.DB_PATH = Path(self.temporary.name) / "redirects.db"
+        conn = connect(webapp.DB_PATH)
+        upsert_items(conn, [{
+            "source": "oppo_gamecenter",
+            "source_item_id": "redirect-target",
+            "name": "重定向目标游戏",
+            "event_type": "launch",
+            "event_time": "2026-08-27",
+        }], "2026-08-27T08:00:00+08:00")
+        rebuild_catalog(conn)
+        self.current_id = conn.execute("SELECT id FROM canonical_games").fetchone()[0]
+        conn.close()
+
+    def tearDown(self):
+        webapp.DB_PATH = self.original_db
+        self.temporary.cleanup()
+
+    @staticmethod
+    def _request(game_id: int) -> Request:
+        return Request({
+            "type": "http", "method": "GET", "path": f"/api/games/{game_id}",
+            "headers": [], "query_string": b"",
+        })
+
+    def _insert_redirects(self, redirects: list[tuple[int, int]]) -> None:
+        conn = connect(webapp.DB_PATH)
+        conn.executemany(
+            """
+            INSERT INTO canonical_game_id_redirects(
+                old_game_id,new_game_id,reason,created_at
+            ) VALUES (?,?,'normalized_name_merge','2026-08-27T10:00:00+08:00')
+            """,
+            redirects,
+        )
+        conn.commit()
+        conn.close()
+
+    def test_game_detail_follows_old_id_redirect_chain(self):
+        old_id = self.current_id + 1000
+        middle_id = old_id + 1
+        self._insert_redirects([
+            (old_id, middle_id),
+            (middle_id, self.current_id),
+        ])
+
+        payload = webapp.game_detail(old_id, self._request(old_id))
+
+        self.assertEqual(payload["id"], self.current_id)
+        self.assertEqual(payload["name"], "重定向目标游戏")
+
+    def test_game_detail_rejects_redirect_cycle(self):
+        first_id = self.current_id + 2000
+        second_id = first_id + 1
+        self._insert_redirects([
+            (first_id, second_id),
+            (second_id, first_id),
+        ])
+
+        payload = webapp.game_detail(first_id, self._request(first_id))
+
+        self.assertEqual(payload, {"error": "not_found"})
+
+    def test_game_detail_rejects_redirect_chain_beyond_limit(self):
+        first_id = self.current_id + 3000
+        redirects = []
+        for offset in range(webapp.GAME_ID_REDIRECT_MAX_HOPS + 1):
+            old_id = first_id + offset
+            new_id = (
+                self.current_id
+                if offset == webapp.GAME_ID_REDIRECT_MAX_HOPS
+                else old_id + 1
+            )
+            redirects.append((old_id, new_id))
+        self._insert_redirects(redirects)
+
+        payload = webapp.game_detail(first_id, self._request(first_id))
+
+        self.assertEqual(payload, {"error": "not_found"})
+
+
 class CatalogDimensionTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -221,6 +307,62 @@ class CatalogDimensionTest(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["featured_event"]["date"], "2026-08-26")
         self.assertEqual(items[0]["featured_event"]["status"], "延期后上线")
+
+    def test_undated_and_dated_observations_share_raw_event_identity(self):
+        rows = [
+            {
+                "id": 1, "source": "xiaomi_gamecenter", "event_type": "reservation",
+                "event_time": "", "last_seen_at": "2026-08-25T06:00:00+08:00",
+            },
+            {
+                "id": 2, "source": "xiaomi_gamecenter", "event_type": "reservation",
+                "event_time": "2026-09-03", "last_seen_at": "2026-08-26T06:00:00+08:00",
+            },
+        ]
+        latest = webapp._latest_event_rows(rows)
+        self.assertEqual(len(latest), 1)
+        self.assertEqual(latest[0]["id"], 2)
+
+    def test_same_batch_earlier_date_revision_wins_by_row_revision(self):
+        observed = "2026-08-27T06:00:00+08:00"
+        rows = [
+            {
+                "id": 8, "source": "oppo_gamecenter", "event_type": "launch",
+                "event_time": "2026-09-10", "last_seen_at": observed,
+            },
+            {
+                "id": 9, "source": "oppo_gamecenter", "event_type": "launch",
+                "event_time": "2026-09-05", "last_seen_at": observed,
+            },
+        ]
+        latest = webapp._latest_event_rows(rows)
+        self.assertEqual(len(latest), 1)
+        self.assertEqual(latest[0]["id"], 9)
+
+    def test_first_seen_filter_does_not_revive_superseded_undated_row(self):
+        conn = connect(webapp.DB_PATH)
+        common = {
+            "name": "定档更新样例", "source": "xiaomi_gamecenter",
+            "event_type": "reservation", "raw": {},
+        }
+        upsert_items(conn, [{
+            **common, "source_item_id": "mi-undated", "event_time": "",
+        }], "2026-08-25T06:00:00+08:00")
+        upsert_items(conn, [{
+            **common, "source_item_id": "mi-dated", "event_time": "2026-09-03",
+        }], "2026-08-26T06:00:00+08:00")
+        rebuild_catalog(conn)
+        conn.close()
+
+        stale = webapp._filtered_games(
+            "all", event_types={"first_seen"}, q="定档更新样例", view_mode="channel",
+        )
+        self.assertEqual(stale, [])
+        current = webapp._filtered_games(
+            "all", event_types={"reservation"}, q="定档更新样例", view_mode="channel",
+        )
+        self.assertEqual(len(current), 1)
+        self.assertEqual(current[0]["featured_event"]["date"], "2026-09-03")
 
     def test_date_filter_runs_after_product_aggregation(self):
         items = webapp._filtered_games(
