@@ -1,7 +1,12 @@
 import json
 import sqlite3
+import time
 import uuid
 from pathlib import Path
+
+
+SCHEMA_VERSION = 3
+DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 
 SCHEMA = """
@@ -501,11 +506,10 @@ CREATE TABLE IF NOT EXISTS model_migration_runs (
 """
 
 
-def connect(path: Path) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
+def _apply_schema_migrations(conn: sqlite3.Connection) -> None:
+    """在受控启动/迁移阶段应用幂等 Schema，业务请求不得调用。"""
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
     # 对已经存在的第一版数据库做无损迁移。
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(source_items)")}
@@ -607,8 +611,66 @@ def connect(path: Path) -> sqlite3.Connection:
       );
     END;
     """)
+    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
+
+
+def connect(
+    path: Path,
+    *,
+    migrate: bool = True,
+    read_only: bool = False,
+) -> sqlite3.Connection:
+    """打开数据库连接；仅启动、CLI 或独立迁移流程应保留 migrate=True。"""
+    path = Path(path).expanduser().resolve()
+    if read_only and migrate:
+        raise ValueError("只读连接不能执行 Schema migration")
+    if not read_only:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path, timeout=DEFAULT_BUSY_TIMEOUT_MS / 1_000)
+    else:
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=DEFAULT_BUSY_TIMEOUT_MS / 1_000)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
+    if migrate:
+        _apply_schema_migrations(conn)
     return conn
+
+
+def connect_readonly(path: Path) -> sqlite3.Connection:
+    """以 SQLite URI mode=ro 打开不执行 DDL 的查询连接。"""
+    return connect(path, migrate=False, read_only=True)
+
+
+def migrate_database(path: Path) -> int:
+    """独立应用数据库 Schema，并返回迁移后的 user_version。"""
+    conn = connect(path, migrate=True)
+    try:
+        return int(conn.execute("PRAGMA user_version").fetchone()[0])
+    finally:
+        conn.close()
+
+
+def begin_immediate_with_retry(
+    conn: sqlite3.Connection,
+    *,
+    attempts: int = 3,
+    initial_delay: float = 0.1,
+) -> None:
+    """以有界指数退避获取写锁，超限后保留原始 SQLite 异常。"""
+    if attempts < 1:
+        raise ValueError("attempts 必须大于 0")
+    for attempt in range(attempts):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            return
+        except sqlite3.OperationalError as exc:
+            message = str(exc).casefold()
+            retryable = "locked" in message or "busy" in message
+            if not retryable or attempt + 1 >= attempts:
+                raise
+            time.sleep(initial_delay * (2 ** attempt))
 
 
 def upsert_items(

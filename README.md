@@ -250,6 +250,26 @@ PYTHONPATH=src python scripts/migrate_phase2.py rollback \
 
 图标和图集下载默认只允许代码内列出的官方商店/CDN 域名，并拒绝内网 DNS、异常端口、跨域重定向、超大响应和超大像素。确需调整时可通过 `NEWGAME_TRUSTED_MEDIA_HOSTS` 提供完整的逗号分隔白名单；设置该变量会替换而不是追加默认清单。
 
+## 第三阶段数据库与发布基础
+
+Web 服务只在进程启动时迁移 Schema，普通请求连接不再执行 DDL。也可以在停写窗口独立执行，并在迁移前生成一致快照：
+
+```bash
+PYTHONPATH=src python scripts/migrate_schema.py \
+  --db /var/lib/newgame-monitor/data/newgame_monitor.db \
+  --backup-dir /var/lib/newgame-monitor/backups
+```
+
+数据库默认使用 WAL 和 5 秒 busy timeout；纯查询工具应使用 `connect_readonly()`。发布目录必须同时提供 `checksums.sha256`，且校验 `release.tar.gz`、`media_manifest.json`、`apply_media_manifest.py` 和 `validate_readiness.py`：
+
+```bash
+(cd /opt/newgame-monitor/incoming/RELEASE_ID && \
+  sha256sum release.tar.gz media_manifest.json apply_media_manifest.py \
+  validate_readiness.py > checksums.sha256)
+```
+
+发布脚本会等待存活探针最多 30 秒，并比较切换前后的 `readyz`：允许既有故障保持，不允许新增就绪故障，否则自动切回上一 release。
+
 ## 测试
 
 ```powershell

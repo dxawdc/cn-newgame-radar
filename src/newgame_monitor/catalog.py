@@ -10,6 +10,8 @@ import uuid
 from collections import defaultdict
 from datetime import datetime
 
+from .db import begin_immediate_with_retry
+
 
 SOURCE_LABELS = {
     "taptap": "TapTap",
@@ -751,7 +753,7 @@ def rebuild_catalog(conn: sqlite3.Connection, *, manage_transaction: bool = True
     if manage_transaction:
         if conn.in_transaction:
             raise RuntimeError("重建产品目录前存在未提交事务")
-        conn.execute("BEGIN IMMEDIATE")
+        begin_immediate_with_retry(conn)
     elif not conn.in_transaction:
         raise RuntimeError("外部事务模式下必须先开启事务")
     try:

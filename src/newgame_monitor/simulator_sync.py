@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 from .catalog import audit_catalog_completeness, rebuild_catalog
-from .db import connect, upsert_items
+from .db import begin_immediate_with_retry, connect, upsert_items
 from .gallery import cache_remote_screenshots
 from .icon_cache import cache_remote_icons
 
@@ -447,7 +447,7 @@ def import_bundle(
 
         created_media: list[tuple[Path, Path]] = []
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate_with_retry(conn)
             imported = 0
             for observed_at, group in grouped.items():
                 imported += upsert_items(conn, group, observed_at, commit=False)

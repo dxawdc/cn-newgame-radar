@@ -1,13 +1,83 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from newgame_monitor.catalog import rebuild_catalog
-from newgame_monitor.db import connect, upsert_items
+from newgame_monitor.db import (
+    SCHEMA_VERSION,
+    begin_immediate_with_retry,
+    connect,
+    connect_readonly,
+    migrate_database,
+    upsert_items,
+)
 
 
 class SourceItemUpsertTest(unittest.TestCase):
+    def test_request_connection_skips_schema_migration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "test.db"
+            self.assertEqual(migrate_database(path), SCHEMA_VERSION)
+            with patch("newgame_monitor.db._apply_schema_migrations") as migration:
+                conn = connect(path, migrate=False)
+                try:
+                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+                finally:
+                    conn.close()
+            migration.assert_not_called()
+
+    def test_wal_busy_timeout_and_readonly_connection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "test.db"
+            conn = connect(path)
+            try:
+                self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+                self.assertEqual(conn.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
+            finally:
+                conn.close()
+            readonly = connect_readonly(path)
+            try:
+                self.assertEqual(readonly.execute("SELECT COUNT(*) FROM source_items").fetchone()[0], 0)
+                with self.assertRaises(sqlite3.OperationalError):
+                    readonly.execute("DELETE FROM source_items")
+            finally:
+                readonly.close()
+
+    def test_wal_reader_remains_available_during_write_transaction(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "test.db"
+            writer = connect(path)
+            reader = connect_readonly(path)
+            try:
+                begin_immediate_with_retry(writer)
+                writer.execute(
+                    "INSERT INTO collection_runs(source,started_at,status) VALUES ('taptap','now','running')"
+                )
+                self.assertEqual(reader.execute("SELECT COUNT(*) FROM collection_runs").fetchone()[0], 0)
+                writer.commit()
+                self.assertEqual(reader.execute("SELECT COUNT(*) FROM collection_runs").fetchone()[0], 1)
+            finally:
+                reader.close()
+                writer.close()
+
+    def test_write_lock_retry_is_bounded(self):
+        class BusyConnection:
+            calls = 0
+
+            def execute(self, _sql):
+                self.calls += 1
+                raise sqlite3.OperationalError("database is locked")
+
+        conn = BusyConnection()
+        with patch("newgame_monitor.db.time.sleep") as sleep:
+            with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                begin_immediate_with_retry(conn, attempts=3, initial_delay=0.01)
+        self.assertEqual(conn.calls, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.01, 0.02])
+
     def test_connect_creates_canonical_game_id_redirects(self):
         with tempfile.TemporaryDirectory() as folder:
             conn = connect(Path(folder) / "test.db")

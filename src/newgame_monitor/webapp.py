@@ -47,7 +47,7 @@ from .catalog import (
     EVENT_LABELS, SOURCE_LABELS, SOURCE_NOTES, SOURCE_ORDER, SOURCE_QUALITY,
     rebuild_catalog,
 )
-from .db import connect
+from .db import connect, connect_readonly
 from .gallery import extract_gallery_urls, gallery_urls_from_rows
 from .phase2_model import (
     CONTROLLED_EVENT_TYPES, audit_phase2_model, finish_review_job,
@@ -92,7 +92,13 @@ APP_ONLY_DETAIL_SOURCES = {
 
 
 def _conn() -> sqlite3.Connection:
-    return connect(DB_PATH)
+    # Schema 已在 lifespan 中迁移；请求连接只做业务读写，禁止重复 DDL。
+    return connect(DB_PATH, migrate=False)
+
+
+def _read_conn() -> sqlite3.Connection:
+    """为高频纯查询路径提供 OS 级只读连接。"""
+    return connect_readonly(DB_PATH)
 
 
 class LoginPayload(BaseModel):
@@ -165,7 +171,7 @@ def _permissions(user: dict) -> dict:
 
 
 def _favorite_dates(user_id: int) -> dict[str, str]:
-    conn = _conn()
+    conn = _read_conn()
     try:
         result: dict[str, str] = {}
         for row in conn.execute(
@@ -643,7 +649,7 @@ def _filtered_games(
         start = date.fromisoformat(date_from)
     if date_to:
         end = date.fromisoformat(date_to)
-    conn = _conn()
+    conn = _read_conn()
     try:
         games = _load_catalog(conn)
     finally:
@@ -921,7 +927,7 @@ def list_reviews(
         clauses.append("q.status=?")
         values.append(status)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    conn = _conn()
+    conn = _read_conn()
     try:
         rows = conn.execute(
             f"""
@@ -972,7 +978,7 @@ def update_review(review_id: int, payload: ReviewUpdatePayload, request: Request
 @app.get("/api/internal/model-v2/health")
 def model_v2_health(request: Request):
     _admin_context(request)
-    conn = _conn()
+    conn = _read_conn()
     try:
         return audit_phase2_model(conn)
     finally:
@@ -1363,7 +1369,7 @@ def export_favorites(request: Request):
 def api_favorites(request: Request):
     """使用账号生成的 Bearer API Key 获取该账号当前关注的产品。"""
     user = _api_key_user(request)
-    conn = _conn()
+    conn = _read_conn()
     try:
         items = _favorite_products(conn, user["id"])
     finally:
@@ -1426,7 +1432,7 @@ def games(
 def game_detail(game_id: int, request: Request):
     context = _session_context(request, required=False)
     favorite_dates = _favorite_dates(context["user"]["id"]) if context else {}
-    conn = _conn()
+    conn = _read_conn()
     try:
         catalog = _load_catalog(conn)
         games_by_id = {item["id"]: item for item in catalog}
@@ -1448,7 +1454,7 @@ def game_detail_by_uuid(game_uuid: str, request: Request):
     """稳定产品 ID 详情接口；合并后的旧 UUID 会安全跟随重定向。"""
     context = _session_context(request, required=False)
     favorite_dates = _favorite_dates(context["user"]["id"]) if context else {}
-    conn = _conn()
+    conn = _read_conn()
     try:
         current_uuid = resolve_game_uuid(conn, game_uuid)
         if not current_uuid:
@@ -1485,7 +1491,7 @@ def summary(
     event_count = len(_filtered_games(
         "all", event_types=set(EVENT_LABELS), view_mode="channel",
     ))
-    conn = _conn()
+    conn = _read_conn()
     try:
         last = conn.execute(
             "SELECT finished_at FROM collection_runs WHERE status='success' ORDER BY finished_at DESC LIMIT 1"
@@ -1505,7 +1511,7 @@ def summary(
 
 @app.get("/api/filters")
 def filters():
-    conn = _conn()
+    conn = _read_conn()
     try:
         categories = [row[0] for row in conn.execute(
             "SELECT category FROM canonical_games WHERE category IS NOT NULL AND category<>'' GROUP BY category ORDER BY COUNT(*) DESC, category LIMIT 80"
@@ -1582,7 +1588,7 @@ def calendar(
 
 
 def _health_snapshot(*, include_errors: bool = False) -> dict:
-    conn = _conn()
+    conn = _read_conn()
     try:
         rows = list(conn.execute(
             """
