@@ -205,7 +205,10 @@ python -m newgame_monitor.cli `
 | `GET` | `/api/games/{id}` | 产品详情与渠道事件 |
 | `GET` | `/api/calendar` | 日期事件分布，支持与列表相同的维度及主要筛选参数 |
 | `GET` | `/api/filters` | 可选筛选项 |
-| `GET` | `/api/health` | 采集器运行状态 |
+| `GET` | `/livez` | 进程存活检查，不依赖数据库 |
+| `GET` | `/readyz` | 必需渠道状态和新鲜度检查，未就绪返回 503 |
+| `GET` | `/api/health` | 脱敏的采集器和 pipeline 运行摘要 |
+| `GET` | `/api/internal/health` | 管理员可见的运行阶段与错误详情 |
 | `GET` | `/api/v1/favorites` | 使用个人 API Key 读取关注产品 |
 
 个人关注 API 示例：
@@ -217,7 +220,7 @@ curl -H "Authorization: Bearer ngr_your_api_key" \
 
 ## 每日定时运行
 
-`deploy/newgame-monitor-daily.service` 与 `deploy/newgame-monitor-daily.timer` 提供通用 systemd 示例，默认每天北京时间 06:00 执行无需 Android 登录态的渠道。部署前请按实际用户、目录、虚拟环境和反向代理路径修改模板。
+`deploy/newgame-monitor-daily.service` 与 `deploy/newgame-monitor-daily.timer` 提供通用 systemd 示例，默认每天北京时间 06:00 执行无需 Android 登录态的渠道。发布脚本将数据库、媒体和 raw 固定放在 `/var/lib/newgame-monitor`，release 目录只保留代码；发布前使用 SQLite Backup API 生成并校验一致快照。部署前请按实际用户、目录、虚拟环境和反向代理路径修改模板。
 
 Windows 可使用任务计划程序执行 `scripts/run_daily.ps1`。需要模拟器与远端同步时，应从示例脚本复制为本机专用脚本，并通过环境变量或 Git 忽略的本地配置保存设备路径、SSH 别名和健康检查地址。
 

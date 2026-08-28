@@ -97,6 +97,22 @@ class SourceItemUpsertTest(unittest.TestCase):
             self.assertEqual(raw["calendar"], "today")
             conn.close()
 
+    def test_blank_event_end_time_does_not_erase_known_end_time(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conn = connect(Path(folder) / "test.db")
+            base = {
+                "source": "oppo_gamecenter",
+                "source_item_id": "beta-window",
+                "name": "测试窗口样例",
+                "event_type": "beta",
+                "event_time": "2026-08-28",
+            }
+            upsert_items(conn, [{**base, "event_end_time": "2026-09-02"}], "2026-08-28T08:00:00+08:00")
+            upsert_items(conn, [{**base, "event_end_time": ""}], "2026-08-28T09:00:00+08:00")
+            row = conn.execute("SELECT event_end_time FROM source_items").fetchone()
+            self.assertEqual(row["event_end_time"], "2026-09-02")
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

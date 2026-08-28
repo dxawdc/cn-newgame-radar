@@ -42,7 +42,22 @@ def _adb_path() -> Path:
 
 
 def _adb(*args: str) -> bytes:
-    return subprocess.check_output([str(_adb_path()), "-s", SERIAL, *args], stderr=subprocess.DEVNULL)
+    attempts = int(os.environ.get("NEWGAME_ADB_ATTEMPTS", "3"))
+    timeout = int(os.environ.get("NEWGAME_ADB_TIMEOUT_SECONDS", "45"))
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return subprocess.check_output(
+                [str(_adb_path()), "-s", SERIAL, *args],
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+            )
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as exc:
+            last_error = exc
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.75 * (2 ** attempt))
+    raise last_error
 
 
 def _read_root_file(path: str) -> bytes:
@@ -60,10 +75,16 @@ def _find_game_dicts(value, found: dict, *, id_key: str, name_key: str) -> None:
             _find_game_dicts(child, found, id_key=id_key, name_key=name_key)
 
 
-def _refresh_huawei_new_games() -> bytes | None:
+def _refresh_huawei_new_games() -> tuple[bytes | None, dict]:
     """按需打开华为游戏中心的新游页并下拉刷新缓存。"""
-    if os.environ.get("NEWGAME_REFRESH_HUAWEI") != "1":
-        return None
+    requested = os.environ.get("NEWGAME_REFRESH_HUAWEI") == "1"
+    metrics = {
+        "refresh_requested": requested,
+        "refresh_started_epoch": int(time.time()),
+        "refresh_succeeded": False,
+    }
+    if not requested:
+        return None, metrics
     package = "com.huawei.gamebox"
     try:
         _adb("shell", "am", "force-stop", package)
@@ -94,12 +115,15 @@ def _refresh_huawei_new_games() -> bytes | None:
                 )
                 time.sleep(8)
                 latest = _dump_ui("huawei-refresh-complete")
-                return latest
+                metrics["refresh_succeeded"] = True
+                return latest, metrics
             time.sleep(3)
-        return latest or None
-    except Exception:
+        metrics["refresh_error"] = "华为新游页未在重试次数内就绪"
+        return latest or None, metrics
+    except Exception as exc:
         # 刷新是缓存采集的增强步骤；已有缓存仍可作为降级来源。
-        return None
+        metrics["refresh_error"] = str(exc)[:300]
+        return None, metrics
 
 
 def _huawei_event_fields(game: dict, now_ms: int) -> tuple[str, str, str | None]:
@@ -127,12 +151,12 @@ def _huawei_event_fields(game: dict, now_ms: int) -> tuple[str, str, str | None]
     return event_type, event_time, status
 
 
-def collect_huawei_cache() -> tuple[list[dict], list[tuple[str, bytes]]]:
-    refresh_ui = _refresh_huawei_new_games()
+def collect_huawei_cache() -> tuple[list[dict], list[tuple[str, bytes]], dict]:
+    refresh_ui, coverage = _refresh_huawei_new_games()
     package = "com.huawei.gamebox"
     command = f"su -c 'find /data/data/{package}/cache/httpCache -type f -size -2097152c 2>/dev/null'"
     paths = _adb("shell", command).decode("utf-8", errors="ignore").splitlines()
-    page = None
+    candidates = []
     for path in paths:
         content = _read_root_file(path)
         text = content.decode("utf-8", errors="ignore")
@@ -144,10 +168,40 @@ def collect_huawei_cache() -> tuple[list[dict], list[tuple[str, bytes]]]:
         except (json.JSONDecodeError, UnicodeDecodeError):
             continue
         if candidate.get("rtnCode") == 0 and candidate.get("name") == "新游":
-            page = candidate
-            break
-    if page is None:
+            escaped = path.replace("'", "'\\''")
+            try:
+                mtime_text = _adb(
+                    "shell", f"su -c \"stat -c %Y '{escaped}'\""
+                ).decode("utf-8", errors="ignore").strip()
+                mtime = int(re.search(r"\d+", mtime_text).group())
+            except (AttributeError, TypeError, ValueError, OSError, subprocess.SubprocessError):
+                mtime = 0
+            candidates.append((mtime, path, candidate))
+    if not candidates:
         raise ValueError("华为缓存中未找到“新游”页面；请先在 App 中刷新该页")
+    selected_mtime, selected_path, page = max(candidates, key=lambda item: item[0])
+    cache_age = max(0, int(time.time()) - selected_mtime) if selected_mtime else None
+    max_age = int(os.environ.get("NEWGAME_HUAWEI_CACHE_MAX_AGE_SECONDS", "86400"))
+    fresh_after_refresh = (
+        not coverage["refresh_requested"]
+        or (
+            coverage["refresh_succeeded"]
+            and selected_mtime >= coverage["refresh_started_epoch"] - 60
+        )
+    )
+    coverage.update({
+        "cache_path_hash": hashlib.sha256(selected_path.encode("utf-8")).hexdigest()[:12],
+        "cache_mtime_epoch": selected_mtime,
+        "cache_age_seconds": cache_age,
+        "candidate_cache_files": len(candidates),
+        "complete": bool(
+            selected_mtime
+            and cache_age is not None
+            and cache_age <= max_age
+            and fresh_after_refresh
+        ),
+    })
+    coverage["coverage_status"] = "complete" if coverage["complete"] else "stale"
 
     games = {}
     _find_game_dicts(page, games, id_key="appId", name_key="name")
@@ -188,7 +242,8 @@ def collect_huawei_cache() -> tuple[list[dict], list[tuple[str, bytes]]]:
     raw_responses = [("new-games-cache", public_raw)]
     if refresh_ui:
         raw_responses.append(("new-games-refresh-ui", refresh_ui))
-    return items, raw_responses
+    coverage["items"] = len(items)
+    return items, raw_responses, coverage
 
 
 def collect_xiaomi_cache() -> tuple[list[dict], list[tuple[str, bytes]]]:
@@ -991,7 +1046,7 @@ def _parse_honor_list(
 
 def _collect_vertical_ui(
     prefix: str, parser, *, max_swipes: int = 8, detail_seen: set[str] | None = None,
-) -> tuple[list[dict], list[tuple[str, bytes]]]:
+) -> tuple[list[dict], list[tuple[str, bytes]], dict]:
     found, raws, stable = {}, [], 0
     detail_seen = detail_seen if detail_seen is not None else set()
     for index in range(max_swipes):
@@ -1033,10 +1088,18 @@ def _collect_vertical_ui(
             break
         _adb("shell", "input", "swipe", "720", "2200", "720", "700", "450")
         time.sleep(1)
-    return list(found.values()), raws
+    complete = stable >= 2
+    return list(found.values()), raws, {
+        "complete": complete,
+        "coverage_status": "complete" if complete else "truncated",
+        "swipes": index + 1,
+        "max_swipes": max_swipes,
+        "stop_reason": "stable_end" if complete else "max_swipes",
+        "items": len(found),
+    }
 
 
-def collect_honor_ui() -> tuple[list[dict], list[tuple[str, bytes]]]:
+def collect_honor_ui() -> tuple[list[dict], list[tuple[str, bytes]], dict]:
     """通过荣耀游戏中心普通用户可见的列表 UI 采集精品首发和内测专区。"""
     _adb("shell", "am", "force-stop", "com.nearme.gamecenter")
     start_xml = _start_app(
@@ -1065,7 +1128,7 @@ def collect_honor_ui() -> tuple[list[dict], list[tuple[str, bytes]]]:
     _tap_node(more)
     time.sleep(3)
     detail_seen: set[str] = set()
-    launches, launch_raws = _collect_vertical_ui(
+    launches, launch_raws, launch_coverage = _collect_vertical_ui(
         "honor-launch", lambda xml: _parse_honor_list(xml, "launch"), detail_seen=detail_seen,
     )
 
@@ -1084,13 +1147,19 @@ def collect_honor_ui() -> tuple[list[dict], list[tuple[str, bytes]]]:
         raise ValueError("荣耀找游戏页未找到“内测专区”")
     _tap_node(beta_entry)
     time.sleep(3)
-    betas, beta_raws = _collect_vertical_ui(
+    betas, beta_raws, beta_coverage = _collect_vertical_ui(
         "honor-beta", lambda xml: _parse_honor_list(xml, "beta"), detail_seen=detail_seen,
     )
     items = launches + betas
     if not items:
         raise ValueError("荣耀 UI 未读取到精品首发或内测游戏")
-    return items, [("new-home", new_xml), ("find-games", find_xml), *launch_raws, *beta_raws]
+    coverage = {
+        "complete": launch_coverage["complete"] and beta_coverage["complete"],
+        "sections": {"launch": launch_coverage, "beta": beta_coverage},
+        "items": len(items),
+    }
+    coverage["coverage_status"] = "complete" if coverage["complete"] else "truncated"
+    return items, [("new-home", new_xml), ("find-games", find_xml), *launch_raws, *beta_raws], coverage
 
 
 def _oppo_home_to_new_game() -> bytes:
@@ -1325,7 +1394,7 @@ def _enrich_visible_oppo_details(xml: bytes, items: list[dict], detail_seen: set
 
 def _collect_oppo_timeline(
     prefix: str, event_type: str, detail_seen: set[str] | None = None,
-) -> tuple[list[dict], list[tuple[str, bytes]]]:
+) -> tuple[list[dict], list[tuple[str, bytes]], dict]:
     found, raws, stable, current_date = {}, [], 0, ""
     detail_seen = detail_seen if detail_seen is not None else set()
     for index in range(9):
@@ -1348,10 +1417,18 @@ def _collect_oppo_timeline(
             break
         _adb("shell", "input", "swipe", "720", "2200", "720", "650", "500")
         time.sleep(1)
-    return list(found.values()), raws
+    complete = stable >= 2
+    return list(found.values()), raws, {
+        "complete": complete,
+        "coverage_status": "complete" if complete else "truncated",
+        "swipes": index + 1,
+        "max_swipes": 9,
+        "stop_reason": "stable_end" if complete else "max_swipes",
+        "items": len(found),
+    }
 
 
-def collect_oppo_ui() -> tuple[list[dict], list[tuple[str, bytes]]]:
+def collect_oppo_ui() -> tuple[list[dict], list[tuple[str, bytes]], dict]:
     """采集 OPPO 新游页的首发、招募测试和内测三个稳定分区。"""
     first_xml = _oppo_home_to_new_game()
     found, raws = {}, [("newgame", first_xml)]
@@ -1366,6 +1443,8 @@ def collect_oppo_ui() -> tuple[list[dict], list[tuple[str, bytes]]]:
     for item in today_items:
         found[(item["source_item_id"], item["event_type"], item["event_time"])] = item
     timelines = (("首发好游", "launch"), ("招募测试", "recruiting_beta"), ("内测游戏", "beta"))
+    section_coverage = {}
+    missing_sections = []
     for index, (title, event_type) in enumerate(timelines):
         # 详情页多次返回后 ViewPager 偶尔会丢失分区入口；
         # 每个分区从新游首页重新进入，避免前一分区影响后一分区。
@@ -1375,12 +1454,17 @@ def collect_oppo_ui() -> tuple[list[dict], list[tuple[str, bytes]]]:
         entry = _node_by_text(root, title, min_top=1200)
         if entry is None:
             raws.append((f"missing-{event_type}", main_xml))
+            missing_sections.append(event_type)
+            section_coverage[event_type] = {
+                "complete": False, "stop_reason": "missing_section", "items": 0,
+            }
             continue
         _tap_node(entry)
         time.sleep(3)
-        timeline_items, timeline_raws = _collect_oppo_timeline(
+        timeline_items, timeline_raws, timeline_coverage = _collect_oppo_timeline(
             event_type, event_type, detail_seen=detail_seen,
         )
+        section_coverage[event_type] = timeline_coverage
         for item in timeline_items:
             found[(item["source_item_id"], item["event_type"], item["event_time"])] = item
         raws.extend(timeline_raws)
@@ -1388,4 +1472,15 @@ def collect_oppo_ui() -> tuple[list[dict], list[tuple[str, bytes]]]:
         time.sleep(2)
     if not found:
         raise ValueError("OPPO 新游分区未读取到游戏")
-    return list(found.values()), raws
+    coverage = {
+        "complete": not missing_sections and all(
+            section.get("complete") for section in section_coverage.values()
+        ),
+        "sections": section_coverage,
+        "missing_sections": missing_sections,
+        "items": len(found),
+    }
+    coverage["coverage_status"] = (
+        "missing" if missing_sections else ("complete" if coverage["complete"] else "truncated")
+    )
+    return list(found.values()), raws, coverage

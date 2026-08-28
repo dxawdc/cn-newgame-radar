@@ -1,8 +1,11 @@
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from starlette.requests import Request
+from starlette.responses import Response
 
 from newgame_monitor import webapp
 from newgame_monitor.catalog import rebuild_catalog
@@ -88,6 +91,30 @@ class WebAppTest(unittest.TestCase):
             [event["date"] for event in result["events"]],
             ["2026-08-20", "2027-04-30"],
         )
+
+    def test_featured_event_prefers_latest_confirmation_on_same_day(self):
+        members = [
+            {
+                "source": "taptap", "event_type": "launch", "event_time": "2026-08-28",
+                "event_end_time": "", "status": "旧确认", "detail_url": None,
+                "first_seen_at": "2026-08-27T08:00:00+08:00",
+                "last_seen_at": "2026-08-27T08:00:00+08:00",
+            },
+            {
+                "source": "oppo_gamecenter", "event_type": "launch", "event_time": "2026-08-28",
+                "event_end_time": "", "status": "新确认", "detail_url": None,
+                "first_seen_at": "2026-08-27T08:00:00+08:00",
+                "last_seen_at": "2026-08-28T08:00:00+08:00",
+            },
+        ]
+        game = {
+            "id": 1, "canonical_key": "name:同日样例", "name": "同日样例",
+            "developer": None, "category": None, "tags_json": "[]",
+            "gameplay_intro": None, "icon_url": "", "rating": None,
+            "first_seen_at": members[0]["first_seen_at"],
+            "last_seen_at": members[1]["last_seen_at"], "members": members,
+        }
+        self.assertEqual(_serialize(game)["featured_event"]["status"], "新确认")
 
     def test_taptap_detail_uses_untruncated_content_node(self):
         root = {
@@ -257,6 +284,7 @@ class CatalogDimensionTest(unittest.TestCase):
         }
         rows = [
             {**common, "source": "taptap", "source_item_id": "tap-1", "event_type": "launch", "event_time": "2026-08-23", "status": "上线"},
+            {**common, "source": "taptap", "source_item_id": "tap-beta", "event_type": "beta", "event_time": "2026-08-25", "status": "限量测试"},
             {**common, "source": "xiaomi_gamecenter", "source_item_id": "mi-1", "event_type": "launch", "event_time": "2026-08-23", "status": "首发"},
             {**common, "source": "haoyou_kuaibao", "source_item_id": "hy-1", "event_type": "launch", "event_time": "2026-08-24", "status": "上线"},
             {**common, "source": "233_leyuan", "source_item_id": "233-1", "event_type": "beta", "event_time": "2026-08-22", "status": "测试"},
@@ -274,24 +302,25 @@ class CatalogDimensionTest(unittest.TestCase):
         webapp.DB_PATH = self.original_db
         self.temporary.cleanup()
 
-    def test_product_view_uses_earliest_date_and_merges_same_day_channels(self):
+    def test_product_view_aggregates_all_event_types_into_one_product(self):
         items = webapp._filtered_games("all", view_mode="product")
-        launch = next(item for item in items if item["featured_event"]["type"] == "launch")
-        self.assertEqual(launch["featured_event"]["date"], "2026-08-23")
+        self.assertEqual(len(items), 1)
+        product = items[0]
+        self.assertEqual(product["group_key"], product["key"])
+        self.assertEqual(product["featured_event"]["date"], "2026-08-26")
         self.assertEqual(
-            [source["key"] for source in launch["event_sources"]],
-            ["taptap", "xiaomi_gamecenter"],
+            [source["key"] for source in product["event_sources"]],
+            ["taptap", "xiaomi_gamecenter", "233_leyuan", "haoyou_kuaibao", "uc_9game"],
         )
-        self.assertEqual(launch["later_event_count"], 1)
+        self.assertEqual(product["later_event_count"], len(product["events"]) - 1)
 
-    def test_channel_view_keeps_each_source_event(self):
+    def test_channel_view_aggregates_by_product_and_source(self):
         items = webapp._filtered_games("all", view_mode="channel")
-        launch_dates = sorted(
-            item["featured_event"]["date"]
-            for item in items
-            if item["featured_event"]["type"] == "launch"
-        )
-        self.assertEqual(launch_dates, ["2026-08-23", "2026-08-23", "2026-08-26"])
+        self.assertEqual(len(items), 5)
+        taptap = next(item for item in items if item["event_sources"][0]["key"] == "taptap")
+        self.assertEqual(taptap["group_key"], f'{taptap["key"]}|taptap')
+        self.assertEqual({event["type"] for event in taptap["events"]}, {"launch", "beta"})
+        self.assertEqual(taptap["channel_event_count"], 2)
 
     def test_source_scope_recalculates_product_earliest_date(self):
         items = webapp._filtered_games(
@@ -364,24 +393,29 @@ class CatalogDimensionTest(unittest.TestCase):
         self.assertEqual(len(current), 1)
         self.assertEqual(current[0]["featured_event"]["date"], "2026-09-03")
 
-    def test_date_filter_runs_after_product_aggregation(self):
+    def test_date_filter_scopes_events_before_product_aggregation(self):
         items = webapp._filtered_games(
-            "all", date_from="2026-08-24", date_to="2026-08-24",
+            "all", date_from="2026-08-23", date_to="2026-08-23",
             event_types={"launch"}, view_mode="product",
         )
-        self.assertEqual(items, [])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["featured_event"]["date"], "2026-08-23")
+        self.assertEqual(len(items[0]["events"]), 2)
         scoped = webapp._filtered_games(
             "all", date_from="2026-08-24", date_to="2026-08-24",
             sources={"haoyou_kuaibao"}, event_types={"launch"}, view_mode="product",
         )
+        # 同一产品＋渠道＋事件类型只保留最新档期，8 月 24 日
+        # 已被 8 月 26 日的延期记录取代。
         self.assertEqual(scoped, [])
 
-    def test_different_event_types_and_first_seen_remain_separate(self):
+    def test_different_event_types_and_first_seen_remain_one_product(self):
         items = webapp._filtered_games("all", view_mode="product")
-        by_type = {item["featured_event"]["type"]: item for item in items}
-        self.assertEqual(set(by_type), {"beta", "launch", "first_seen"})
-        self.assertEqual(by_type["beta"]["featured_event"]["date"], "2026-08-22")
-        self.assertEqual(by_type["first_seen"]["featured_event"]["date"], "2026-08-25")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(
+            {event["type"] for event in items[0]["events"]},
+            {"beta", "launch", "first_seen"},
+        )
 
     def test_api_event_scope_excludes_first_seen_by_default_and_can_include_it(self):
         default_items = webapp._filtered_games(
@@ -395,6 +429,59 @@ class CatalogDimensionTest(unittest.TestCase):
         )
         self.assertEqual(len(discovery_items), 1)
         self.assertEqual(discovery_items[0]["featured_event"]["type"], "first_seen")
+
+
+class HealthEndpointTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.original_db = webapp.DB_PATH
+        webapp.DB_PATH = Path(self.temporary.name) / "health.db"
+        observed = datetime.now().astimezone().isoformat()
+        conn = connect(webapp.DB_PATH)
+        for source in ("taptap", "huawei-cache", "honor-ui", "oppo-ui"):
+            conn.execute(
+                """
+                INSERT INTO collection_runs(source,started_at,finished_at,status,item_count)
+                VALUES (?,?,?,'success',10)
+                """,
+                (source, observed, observed),
+            )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        webapp.DB_PATH = self.original_db
+        self.temporary.cleanup()
+
+    def test_livez_does_not_touch_database(self):
+        with patch.object(webapp, "_conn", side_effect=AssertionError("should not connect")):
+            self.assertEqual(webapp.livez()["status"], "alive")
+
+    def test_readyz_returns_503_for_required_failed_source(self):
+        response = Response()
+        self.assertEqual(webapp.readyz(response)["status"], "ready")
+        self.assertEqual(response.status_code, 200)
+
+        conn = connect(webapp.DB_PATH)
+        observed = datetime.now().astimezone().isoformat()
+        conn.execute(
+            """
+            INSERT INTO collection_runs(source,started_at,finished_at,status,item_count,error)
+            VALUES ('oppo-ui',?,?,'failed',0,'ADB timeout')
+            """,
+            (observed, observed),
+        )
+        conn.commit()
+        conn.close()
+        response = Response()
+        payload = webapp.readyz(response)
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("oppo-ui: failed", payload["reasons"])
+
+    def test_public_health_does_not_expose_path_or_error(self):
+        payload = webapp.health()
+        self.assertNotIn("database", payload)
+        self.assertTrue(all("error" not in source for source in payload["sources"]))
 
 
 if __name__ == "__main__":

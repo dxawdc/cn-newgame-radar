@@ -410,9 +410,10 @@ def _latest_event_rows(members: Iterable[sqlite3.Row]) -> list[sqlite3.Row]:
 
 
 def _serialize(game: dict, members: Iterable[sqlite3.Row] | None = None) -> dict:
-    selected = _latest_event_rows(members if members is not None else game["members"])
+    member_rows = list(members) if members is not None else list(game["members"])
+    selected = _latest_event_rows(member_rows)
     sources = sorted(
-        {row["source"] for row in game["members"]},
+        {row["source"] for row in member_rows},
         key=lambda source: (SOURCE_ORDER.get(source, len(SOURCE_ORDER)), SOURCE_LABELS.get(source, source)),
     )
     events = []
@@ -435,11 +436,25 @@ def _serialize(game: dict, members: Iterable[sqlite3.Row] | None = None) -> dict
             "end_date": _iso_date(row["event_end_time"]),
             "status": row["status"],
             "detail_url": _public_detail_url(row["source"], row["detail_url"]),
+            "observed_at": _row_value(row, "last_seen_at"),
         })
     events.sort(key=lambda x: (x["date"] or "9999-12-31", x["source_label"]))
     today = date.today().isoformat()
     upcoming = [event for event in events if event["date"] >= today]
-    featured = upcoming[0] if upcoming else (events[-1] if events else None)
+    if upcoming:
+        featured_date = min(event["date"] for event in upcoming)
+        featured = max(
+            (event for event in upcoming if event["date"] == featured_date),
+            key=lambda event: (event["observed_at"], -SOURCE_ORDER.get(event["source"], 999)),
+        )
+    elif events:
+        featured_date = max(event["date"] for event in events)
+        featured = max(
+            (event for event in events if event["date"] == featured_date),
+            key=lambda event: (event["observed_at"], -SOURCE_ORDER.get(event["source"], 999)),
+        )
+    else:
+        featured = None
     try:
         tags = json.loads(game["tags_json"] or "[]")
     except json.JSONDecodeError:
@@ -466,67 +481,68 @@ def _serialize(game: dict, members: Iterable[sqlite3.Row] | None = None) -> dict
 
 
 def _catalog_entries_for_game(game: dict, members: Iterable[sqlite3.Row], view_mode: str) -> list[dict]:
-    """把渠道原子事件投影为产品聚合或渠道明细列表项。"""
+    """按产品或“产品＋渠道”聚合，事件类型仅作为组内轨迹。"""
     scoped = _latest_event_rows(members)
     if view_mode == "channel":
         entries = []
-        seen = set()
+        grouped: dict[str, list] = defaultdict(list)
         for row in scoped:
-            event_date, _ = _event_date(row)
-            event_type = _effective_event_type(row)
-            event_key = (row["source"], event_type, event_date, row["status"])
-            if event_key in seen:
+            grouped[row["source"]].append(row)
+        for source, rows in sorted(
+            grouped.items(),
+            key=lambda item: (
+                SOURCE_ORDER.get(item[0], len(SOURCE_ORDER)),
+                SOURCE_LABELS.get(item[0], item[0]),
+            ),
+        ):
+            payload = _serialize(game, rows)
+            if not payload["events"]:
                 continue
-            seen.add(event_key)
-            payload = _serialize(game, [row])
             payload.update({
                 "view_mode": "channel",
-                "entry_key": f'{game["canonical_key"]}|{row["source"]}|{event_type}|{event_date}',
+                "group_key": f'{game["canonical_key"]}|{source}',
+                "entry_key": f'{game["canonical_key"]}|{source}',
                 "source_count": 1,
-                "event_sources": [_source_payload(row["source"])],
+                "event_sources": [_source_payload(source)],
                 "event_source_count": 1,
-                "channel_event_count": 1,
-                "later_event_count": 0,
+                "channel_event_count": len(payload["events"]),
+                "later_event_count": max(0, len(payload["events"]) - 1),
             })
             entries.append(payload)
         return entries
 
-    grouped: dict[str, list] = defaultdict(list)
-    for row in scoped:
-        grouped[_effective_event_type(row)].append(row)
-
-    entries = []
-    for event_type, rows in grouped.items():
-        payload = _serialize(game, rows)
-        if not payload["events"]:
-            continue
-        earliest_date = min(event["date"] for event in payload["events"] if event["date"])
-        primary_events = [event for event in payload["events"] if event["date"] == earliest_date]
-        primary_events.sort(
-            key=lambda event: (
-                SOURCE_ORDER.get(event["source"], len(SOURCE_ORDER)),
-                event["source_label"],
-            )
-        )
-        primary_sources = sorted(
-            {event["source"] for event in primary_events},
-            key=lambda source: (SOURCE_ORDER.get(source, len(SOURCE_ORDER)), SOURCE_LABELS.get(source, source)),
-        )
-        featured = dict(primary_events[0])
-        featured["primary_source_count"] = len(primary_sources)
-        scoped_sources = {event["source"] for event in payload["events"]}
-        payload.update({
-            "view_mode": "product",
-            "entry_key": f'{game["canonical_key"]}|{event_type}|{earliest_date}',
-            "featured_event": featured,
-            "source_count": len(scoped_sources),
-            "event_sources": [_source_payload(source) for source in primary_sources],
-            "event_source_count": len(primary_sources),
-            "channel_event_count": len(payload["events"]),
-            "later_event_count": len(payload["events"]) - len(primary_events),
-        })
-        entries.append(payload)
-    return entries
+    payload = _serialize(game, scoped)
+    if not payload["events"]:
+        return []
+    featured = dict(payload["featured_event"])
+    featured_date = featured["date"]
+    primary_sources = sorted(
+        {event["source"] for event in payload["events"] if event["date"] == featured_date},
+        key=lambda source: (
+            SOURCE_ORDER.get(source, len(SOURCE_ORDER)),
+            SOURCE_LABELS.get(source, source),
+        ),
+    )
+    all_sources = sorted(
+        {event["source"] for event in payload["events"]},
+        key=lambda source: (
+            SOURCE_ORDER.get(source, len(SOURCE_ORDER)),
+            SOURCE_LABELS.get(source, source),
+        ),
+    )
+    featured["primary_source_count"] = len(primary_sources)
+    payload.update({
+        "view_mode": "product",
+        "group_key": game["canonical_key"],
+        "entry_key": game["canonical_key"],
+        "featured_event": featured,
+        "source_count": len(all_sources),
+        "event_sources": [_source_payload(source) for source in all_sources],
+        "event_source_count": len(all_sources),
+        "channel_event_count": len(payload["events"]),
+        "later_event_count": max(0, len(payload["events"]) - 1),
+    })
+    return [payload]
 
 
 _EVENT_ONLY_INTRO = re.compile(
@@ -614,15 +630,19 @@ def _filtered_games(
             if not event_types or _effective_event_type(row) in event_types
         ]
         if selected:
-            # 日期筛选必须发生在聚合之后，否则范围起点会被误当作“最早渠道日期”。
-            for entry in _catalog_entries_for_game(game, selected, view_mode):
-                event_day = (entry.get("featured_event") or {}).get("date")
+            # 先按日期确定命中的事件，再按产品或“产品＋渠道”聚合。事件类型只
+            # 用于筛选和轨迹展示，不再决定列表项数量。
+            date_scoped = []
+            for row in selected:
+                event_day, _ = _event_date(row)
                 event_date = date.fromisoformat(event_day) if event_day else None
                 if start and (not event_date or event_date < start):
                     continue
                 if end and (not event_date or event_date > end):
                     continue
-                result.append(entry)
+                date_scoped.append(row)
+            if date_scoped:
+                result.extend(_catalog_entries_for_game(game, date_scoped, view_mode))
     return result
 
 
@@ -1356,21 +1376,126 @@ def calendar(
     }
 
 
-@app.get("/api/health")
-def health():
+def _health_snapshot(*, include_errors: bool = False) -> dict:
     conn = _conn()
     try:
-        rows = conn.execute(
+        rows = list(conn.execute(
             """
             SELECT r.* FROM collection_runs r
             JOIN (SELECT source, MAX(id) id FROM collection_runs GROUP BY source) latest ON latest.id=r.id
             ORDER BY r.source
             """
-        )
+        ))
+        sources = []
+        for row in rows:
+            payload = {
+                "source": row["source"],
+                "started_at": row["started_at"],
+                "finished_at": row["finished_at"],
+                "status": row["status"],
+                "item_count": row["item_count"],
+            }
+            if "metrics_json" in row.keys():
+                try:
+                    metrics = json.loads(row["metrics_json"] or "{}")
+                except json.JSONDecodeError:
+                    metrics = {}
+                if metrics:
+                    payload["metrics"] = metrics
+            if include_errors and row["error"]:
+                payload["error"] = row["error"]
+            sources.append(payload)
+        pipeline_row = conn.execute(
+            "SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        pipeline = None
+        if pipeline_row:
+            pipeline = {
+                key: pipeline_row[key]
+                for key in ("run_id", "started_at", "finished_at", "status", "bundle_id")
+            }
+            if include_errors:
+                pipeline["stages"] = [
+                    dict(row) for row in conn.execute(
+                        """
+                        SELECT stage,source,started_at,finished_at,status,detail_json
+                        FROM pipeline_stages WHERE run_id=? ORDER BY id
+                        """,
+                        (pipeline_row["run_id"],),
+                    )
+                ]
         return {
-            "database": str(DB_PATH),
-            "sources": [dict(row) for row in rows],
+            "status": "ok",
+            "sources": sources,
+            "pipeline": pipeline,
+            "active_quarantine": conn.execute(
+                "SELECT COUNT(*) FROM catalog_quarantine WHERE status='active'"
+            ).fetchone()[0],
             "generated_at": datetime.now().astimezone().isoformat(),
         }
     finally:
         conn.close()
+
+
+@app.get("/livez")
+def livez():
+    """进程存活检查，不依赖数据库或外部渠道。"""
+    return {"status": "alive", "generated_at": datetime.now().astimezone().isoformat()}
+
+
+@app.get("/readyz")
+def readyz(response: Response):
+    """数据就绪检查：必需渠道缺失、失败或过期时返回 503。"""
+    try:
+        snapshot = _health_snapshot()
+    except (OSError, sqlite3.Error) as exc:
+        response.status_code = 503
+        return {"status": "not_ready", "reasons": [f"database: {type(exc).__name__}"]}
+    required = {
+        item.strip() for item in os.environ.get(
+            "NEWGAME_REQUIRED_SOURCES", "taptap,huawei-cache,honor-ui,oppo-ui"
+        ).split(",") if item.strip()
+    }
+    max_age_hours = float(os.environ.get("NEWGAME_READY_MAX_AGE_HOURS", "36"))
+    cutoff = datetime.now().astimezone() - timedelta(hours=max_age_hours)
+    by_source = {item["source"]: item for item in snapshot["sources"]}
+    reasons = []
+    degraded = []
+    for source in sorted(required):
+        item = by_source.get(source)
+        if not item:
+            reasons.append(f"{source}: missing")
+            continue
+        if item["status"] == "degraded":
+            degraded.append(source)
+        elif item["status"] != "success":
+            reasons.append(f'{source}: {item["status"]}')
+        timestamp = item.get("finished_at") or item.get("started_at")
+        try:
+            observed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if observed < cutoff:
+                reasons.append(f"{source}: stale")
+        except (AttributeError, ValueError):
+            reasons.append(f"{source}: invalid_timestamp")
+    if reasons:
+        response.status_code = 503
+    return {
+        "status": "not_ready" if reasons else ("ready_degraded" if degraded else "ready"),
+        "reasons": reasons,
+        "degraded_sources": degraded,
+        "generated_at": snapshot["generated_at"],
+    }
+
+
+@app.get("/api/health")
+def health():
+    """公开健康摘要：不暴露数据库路径和详细错误。"""
+    return _health_snapshot()
+
+
+@app.get("/api/internal/health")
+def internal_health(request: Request):
+    context = _session_context(request)
+    if context["user"]["role"] not in {"superadmin", "admin"}:
+        raise HTTPException(status_code=403, detail="当前账号没有运维详情权限")
+    return _health_snapshot(include_errors=True)

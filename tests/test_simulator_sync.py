@@ -1,15 +1,27 @@
 import io
 import json
+import shutil
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from newgame_monitor.db import connect, upsert_items
 from newgame_monitor.simulator_sync import export_bundle, import_bundle
 
 
 class SimulatorSyncTest(unittest.TestCase):
+    @staticmethod
+    def _record_run(conn, source, observed, status="success", error=None):
+        conn.execute(
+            """
+            INSERT INTO collection_runs(source, started_at, finished_at, status, item_count, error)
+            VALUES (?, ?, ?, ?, 1, ?)
+            """,
+            (source, observed, observed, status, error),
+        )
+
     def test_export_and_import_incremental_bundle(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -107,6 +119,188 @@ class SimulatorSyncTest(unittest.TestCase):
                 "测试厂商",
             )
             target.close()
+
+    def test_partial_bundle_publishes_successful_source_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base_db = root / "base.db"
+            conn = connect(base_db)
+            observed = "2026-08-28T07:00:00+08:00"
+            upsert_items(conn, [{
+                "source": "oppo_gamecenter", "source_item_id": "oppo-old",
+                "name": "OPPO 保留产品", "event_type": "launch",
+                "event_time": "2026-08-28", "raw": {},
+            }], observed)
+            conn.close()
+
+            work_db = root / "work.db"
+            target_db = root / "target.db"
+            shutil.copy2(base_db, work_db)
+            shutil.copy2(base_db, target_db)
+            conn = connect(work_db)
+            upsert_items(conn, [{
+                "source": "taptap", "source_item_id": "tap-new",
+                "name": "TapTap 新产品", "event_type": "reservation",
+                "event_time": "2026-09-01", "raw": {},
+            }], observed)
+            self._record_run(conn, "taptap", observed)
+            self._record_run(conn, "oppo-ui", observed, "failed", "ADB 超时")
+            conn.commit()
+            conn.close()
+
+            bundle = root / "partial.tar.gz"
+            exported = export_bundle(
+                work_db, root / "raw", root / "icons", bundle, observed, base_db,
+            )
+            self.assertEqual(exported["publish_status"], "partial")
+            self.assertEqual(exported["published_sources"], ["taptap"])
+            self.assertEqual(exported["items"], 1)
+
+            imported = import_bundle(
+                bundle, target_db, root / "target-raw", root / "target-icons",
+                cache_icons=False,
+            )
+            self.assertEqual(imported["publish_status"], "partial")
+            conn = connect(target_db)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM source_items WHERE source='taptap'").fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM source_items WHERE source='oppo_gamecenter'").fetchone()[0],
+                1,
+            )
+            conn.close()
+
+    def test_snapshot_diff_syncs_historical_update_delete_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base_db = root / "base.db"
+            observed = "2026-08-28T07:00:00+08:00"
+            conn = connect(base_db)
+            upsert_items(conn, [{
+                "source": "honor_gamecenter", "source_item_id": "honor-update",
+                "name": "历史详情待补全", "event_type": "beta",
+                "event_time": "2026-08-01", "gameplay_intro": "旧介绍", "raw": {},
+            }, {
+                "source": "honor_gamecenter", "source_item_id": "honor-delete",
+                "name": "已删除产品", "event_type": "launch",
+                "event_time": "2026-08-02", "raw": {},
+            }], "2026-08-01T07:00:00+08:00")
+            conn.close()
+
+            work_db = root / "work.db"
+            target_db = root / "target.db"
+            shutil.copy2(base_db, work_db)
+            shutil.copy2(base_db, target_db)
+            conn = connect(work_db)
+            conn.execute(
+                "UPDATE source_items SET full_description=? WHERE source_item_id='honor-update'",
+                ("补全后的历史产品详情" * 30,),
+            )
+            conn.execute("DELETE FROM source_items WHERE source_item_id='honor-delete'")
+            self._record_run(conn, "honor-ui", observed)
+            conn.commit()
+            conn.close()
+
+            bundle = root / "diff.tar.gz"
+            exported = export_bundle(
+                work_db, root / "raw", root / "icons", bundle, observed, base_db,
+            )
+            self.assertEqual(exported["items"], 1)
+            self.assertEqual(exported["tombstones"], 1)
+
+            first = import_bundle(
+                bundle, target_db, root / "target-raw", root / "target-icons",
+                cache_icons=False,
+            )
+            second = import_bundle(
+                bundle, target_db, root / "target-raw", root / "target-icons",
+                cache_icons=False,
+            )
+            self.assertFalse(first["duplicate"])
+            self.assertTrue(second["duplicate"])
+            conn = connect(target_db)
+            rows = list(conn.execute("SELECT source_item_id,full_description FROM source_items"))
+            self.assertEqual([row["source_item_id"] for row in rows], ["honor-update"])
+            self.assertTrue(rows[0]["full_description"].startswith("补全后"))
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM applied_bundles").fetchone()[0], 1)
+            conn.close()
+
+    def test_catalog_failure_rolls_back_database_and_media(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_db = root / "source.db"
+            observed = "2026-08-28T07:00:00+08:00"
+            conn = connect(source_db)
+            upsert_items(conn, [{
+                "source": "oppo_gamecenter", "source_item_id": "rollback-item",
+                "name": "回滚测试产品", "event_type": "launch",
+                "event_time": "2026-08-28",
+                "icon_url": "local-icon://ui/oppo_gamecenter/rollback.webp",
+                "raw": {},
+            }], observed)
+            self._record_run(conn, "oppo-ui", observed)
+            conn.commit()
+            conn.close()
+            icon = root / "icons" / "ui" / "oppo_gamecenter" / "rollback.webp"
+            icon.parent.mkdir(parents=True)
+            icon.write_bytes(b"rollback-media")
+            bundle = root / "rollback.tar.gz"
+            export_bundle(source_db, root / "raw", root / "icons", bundle, observed)
+
+            target_db = root / "target.db"
+            target_icons = root / "target-icons"
+            with patch("newgame_monitor.simulator_sync.rebuild_catalog", side_effect=RuntimeError("故障注入")):
+                with self.assertRaisesRegex(RuntimeError, "故障注入"):
+                    import_bundle(
+                        bundle, target_db, root / "target-raw", target_icons,
+                        cache_icons=False,
+                    )
+            conn = connect(target_db)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM source_items").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM collection_runs").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM applied_bundles").fetchone()[0], 0)
+            conn.close()
+            self.assertFalse((target_icons / "ui" / "oppo_gamecenter" / "rollback.webp").exists())
+
+    def test_media_promotion_failure_removes_partial_file_and_rolls_back(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_db = root / "source.db"
+            observed = "2026-08-28T07:00:00+08:00"
+            conn = connect(source_db)
+            upsert_items(conn, [{
+                "source": "oppo_gamecenter", "source_item_id": "media-failure",
+                "name": "媒体回滚产品", "event_type": "launch",
+                "event_time": "2026-08-28",
+                "icon_url": "local-icon://ui/oppo_gamecenter/media-failure.webp",
+                "raw": {},
+            }], observed)
+            self._record_run(conn, "oppo-ui", observed)
+            conn.commit()
+            conn.close()
+            icon = root / "icons" / "ui" / "oppo_gamecenter" / "media-failure.webp"
+            icon.parent.mkdir(parents=True)
+            icon.write_bytes(b"partial-media")
+            bundle = root / "media-failure.tar.gz"
+            export_bundle(source_db, root / "raw", root / "icons", bundle, observed)
+
+            target_db = root / "target.db"
+            target_icons = root / "target-icons"
+            with patch("newgame_monitor.simulator_sync.os.fsync", side_effect=OSError("磁盘写入失败")):
+                with self.assertRaisesRegex(OSError, "磁盘写入失败"):
+                    import_bundle(
+                        bundle, target_db, root / "target-raw", target_icons,
+                        cache_icons=False,
+                    )
+            conn = connect(target_db)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM source_items").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM applied_bundles").fetchone()[0], 0)
+            conn.close()
+            self.assertFalse(
+                (target_icons / "ui" / "oppo_gamecenter" / "media-failure.webp").exists()
+            )
 
     def test_import_rejects_parent_path(self):
         with tempfile.TemporaryDirectory() as temporary:

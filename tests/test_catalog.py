@@ -413,7 +413,7 @@ class CatalogTest(unittest.TestCase):
             self.assertEqual(redirect["new_game_id"], game["id"])
             conn.close()
 
-    def test_rebuild_rejects_ambiguous_split_instead_of_orphaning_favorite(self):
+    def test_rebuild_quarantines_ambiguous_split_without_orphaning_favorite(self):
         with tempfile.TemporaryDirectory() as folder:
             conn = connect(Path(folder) / "test.db")
             observed = "2026-08-27T10:00:00+08:00"
@@ -446,17 +446,20 @@ class CatalogTest(unittest.TestCase):
             conn.execute("UPDATE source_items SET name='产品乙' WHERE source='oppo_gamecenter'")
             conn.commit()
 
-            with self.assertRaisesRegex(RuntimeError, "一对多拆分"):
-                rebuild_catalog(conn)
+            rebuild_catalog(conn)
             self.assertIsNotNone(conn.execute(
                 "SELECT 1 FROM canonical_games WHERE canonical_key=?", (old_key,)
             ).fetchone())
             self.assertEqual(conn.execute(
                 "SELECT game_key FROM user_favorites WHERE user_id=?", (user_id,)
             ).fetchone()[0], old_key)
+            quarantine = conn.execute(
+                "SELECT reason,status FROM catalog_quarantine WHERE issue_key=?", (old_key,)
+            ).fetchone()
+            self.assertEqual(dict(quarantine), {"reason": "one_to_many_split", "status": "active"})
             conn.close()
 
-    def test_rebuild_rejects_split_when_one_target_keeps_old_key(self):
+    def test_rebuild_quarantines_split_when_one_target_keeps_old_key(self):
         with tempfile.TemporaryDirectory() as folder:
             conn = connect(Path(folder) / "test.db")
             observed = "2026-08-27T10:00:00+08:00"
@@ -478,8 +481,7 @@ class CatalogTest(unittest.TestCase):
             )
             conn.commit()
 
-            with self.assertRaisesRegex(RuntimeError, "一对多拆分"):
-                rebuild_catalog(conn)
+            rebuild_catalog(conn)
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM canonical_games").fetchone()[0], 1,
             )
@@ -489,9 +491,15 @@ class CatalogTest(unittest.TestCase):
                 ).fetchone()[0],
                 "name:旧产品",
             )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT status FROM catalog_quarantine WHERE issue_key='name:旧产品'"
+                ).fetchone()[0],
+                "active",
+            )
             conn.close()
 
-    def test_rebuild_rejects_redirect_cycle_and_rolls_back(self):
+    def test_rebuild_quarantines_redirect_cycle_and_keeps_other_catalog_available(self):
         with tempfile.TemporaryDirectory() as folder:
             conn = connect(Path(folder) / "test.db")
             observed = "2026-08-27T10:00:00+08:00"
@@ -512,8 +520,7 @@ class CatalogTest(unittest.TestCase):
             )
             conn.commit()
 
-            with self.assertRaisesRegex(RuntimeError, "重定向出现环"):
-                rebuild_catalog(conn)
+            rebuild_catalog(conn)
             self.assertEqual(
                 {
                     row["canonical_key"]
@@ -524,6 +531,12 @@ class CatalogTest(unittest.TestCase):
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM canonical_key_redirects").fetchone()[0],
                 0,
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM catalog_quarantine WHERE status='active' AND reason='redirect_cycle'"
+                ).fetchone()[0],
+                2,
             )
             conn.close()
 

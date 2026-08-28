@@ -22,10 +22,28 @@ from .event_quality import classify_233_event, classify_haoyou_event
 HEADERS = {"User-Agent": "NewGameMonitor/0.1 (+low-frequency research collector)"}
 
 
-def _get(url: str) -> requests.Response:
-    response = requests.get(url, headers=HEADERS, timeout=20)
-    response.raise_for_status()
-    return response
+def _get(url: str, **kwargs) -> requests.Response:
+    """对网络抖动、405/429 和 5xx 做有界重试，解析错误由上层直接报错。"""
+    attempts = int(kwargs.pop("attempts", 3))
+    timeout = kwargs.pop("timeout", 20)
+    headers = {**HEADERS, **(kwargs.pop("headers", {}) or {})}
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout, **kwargs)
+            if response.status_code in {405, 408, 425, 429} or response.status_code >= 500:
+                response.raise_for_status()
+            else:
+                response.raise_for_status()
+                return response
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+            last_error = exc
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            retryable = status is None or status in {405, 408, 425, 429} or status >= 500
+            if not retryable or attempt == attempts - 1:
+                raise
+            time.sleep(0.5 * (2 ** attempt))
+    raise last_error
 
 
 def _source_id(value: str) -> str:
@@ -48,27 +66,41 @@ def _complete_description(value: str) -> str | None:
     return text
 
 
-def collect_vivo() -> tuple[list[dict], list[tuple[str, bytes]]]:
+def collect_vivo() -> tuple[list[dict], list[tuple[str, bytes]], dict]:
     endpoints = {
         "launch": "https://main.gamecenter.vivo.com.cn/clientRequest/newGameZone/firstPublishList",
         "beta": "https://main.gamecenter.vivo.com.cn/clientRequest/newGameZone/betaTestList",
     }
     items, raws = [], []
+    coverage = {"complete": True, "endpoints": {}}
     for event_type, url in endpoints.items():
-        response = _get(url)
-        raws.append((event_type, response.content))
-        payload = response.json()
-        data = payload.get("data") or {}
-        if event_type == "launch":
-            groups = [(event_type, data.get("listData") or [])]
-        else:
-            groups = [
-                ("limited_beta", data.get("limitedTestGameList") or []),
-                ("important_beta", data.get("importantTestGameList") or []),
-                ("beta", data.get("testGameList") or []),
-            ]
-        for kind, games in groups:
-            for game in games:
+        page_index = 1
+        endpoint_items = 0
+        complete = False
+        seen_pages = set()
+        while page_index <= 50:
+            response = _get(url, params={"pageIndex": page_index, "pageSize": 20})
+            raws.append((f"{event_type}-page-{page_index}", response.content))
+            payload = response.json()
+            data = payload.get("data") or {}
+            if event_type == "launch":
+                groups = [(event_type, data.get("listData") or [])]
+            else:
+                groups = [
+                    ("limited_beta", data.get("limitedTestGameList") or []),
+                    ("important_beta", data.get("importantTestGameList") or []),
+                    ("beta", data.get("testGameList") or []),
+                ]
+            page_signature = tuple(
+                str(game.get("id") or game.get("pkgName"))
+                for _, games in groups for game in games
+            )
+            if page_signature in seen_pages and page_signature:
+                break
+            seen_pages.add(page_signature)
+            page_count = 0
+            for kind, games in groups:
+              for game in games:
                 timestamp = game.get("firstPublishDate") or game.get("testStartDate")
                 event_time = datetime.fromtimestamp(timestamp / 1000).astimezone().isoformat() if timestamp else ""
                 size_kib = game.get("size")
@@ -91,7 +123,28 @@ def collect_vivo() -> tuple[list[dict], list[tuple[str, bytes]]]:
                     "status": game.get("dateTitle") or game.get("firstPublishTime"),
                     "raw": game,
                 })
-    return items, raws
+                page_count += 1
+            endpoint_items += page_count
+            has_next = bool(data.get("hasNext") or payload.get("hasNext"))
+            if not has_next:
+                complete = True
+                break
+            if not page_signature:
+                break
+            page_index += 1
+        coverage["endpoints"][event_type] = {
+            "pages": page_index,
+            "items": endpoint_items,
+            "complete": complete,
+        }
+        coverage["complete"] = coverage["complete"] and complete
+    unique = {
+        (item["source_item_id"], item["event_type"], item["event_time"]): item
+        for item in items
+    }
+    coverage["items"] = len(unique)
+    coverage["coverage_status"] = "complete" if coverage["complete"] else "truncated"
+    return list(unique.values()), raws, coverage
 
 
 def _parse_xiaomi_discovery(payload: dict) -> list[dict]:
@@ -146,13 +199,11 @@ def _parse_xiaomi_discovery(payload: dict) -> list[dict]:
 def collect_xiaomi() -> tuple[list[dict], list[tuple[str, bytes]]]:
     """直连小米游戏中心公开内测专区，不传账号或设备标识。"""
     url = "https://app.knights.mi.com/knights/recommend/simple/page/normal/v6"
-    response = requests.get(
+    response = _get(
         url,
         params={"id": "10003019", "pageSize": "10"},
-        headers=HEADERS,
         timeout=20,
     )
-    response.raise_for_status()
     payload = response.json()
     if payload.get("errCode") != 200:
         raise ValueError(f"小米内测专区返回异常：{payload.get('errCode')}")
@@ -387,13 +438,11 @@ def collect_apple_ios_cn() -> tuple[list[dict], list[tuple[str, bytes]]]:
         chunk = app_ids[index:index + 100]
         label = f"lookup-{index // 100 + 1}"
         try:
-            response = requests.get(
+            response = _get(
                 "https://itunes.apple.com/lookup",
                 params={"id": ",".join(chunk), "country": "cn"},
-                headers=HEADERS,
                 timeout=30,
             )
-            response.raise_for_status()
             raws.append((label, response.content))
             details.extend((response.json() or {}).get("results") or [])
         except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
@@ -532,7 +581,7 @@ def collect_4399() -> tuple[list[dict], list[tuple[str, bytes]]]:
         if not detail_url:
             continue
         try:
-            detail_response = requests.get(detail_url, headers=HEADERS, timeout=20)
+            detail_response = _get(detail_url, timeout=20)
             if detail_response.status_code != 200:
                 continue
         except requests.RequestException:

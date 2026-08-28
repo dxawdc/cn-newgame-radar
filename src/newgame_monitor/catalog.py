@@ -443,6 +443,95 @@ def _resolve_name_identities(
     return root_by_id, display_by_key
 
 
+def _redirect_conflicts(
+    conn: sqlite3.Connection, redirects: dict[str, set[str]],
+) -> dict[str, tuple[str, set[str]]]:
+    """找出会造成一对多、回环或历史键复活的产品键。"""
+    conflicts: dict[str, tuple[str, set[str]]] = {}
+    direct = {
+        row["old_key"]: row["new_key"]
+        for row in conn.execute("SELECT old_key,new_key FROM canonical_key_redirects")
+    }
+    for old_key, targets in redirects.items():
+        if len(targets) > 1:
+            conflicts[old_key] = ("one_to_many_split", set(targets))
+            continue
+        if len(targets) == 1:
+            target = next(iter(targets))
+            if target == old_key and old_key in direct:
+                conflicts[old_key] = (
+                    "redirected_key_reactivated", {old_key, direct[old_key]},
+                )
+            elif target != old_key:
+                direct[old_key] = target
+
+    for origin in sorted(direct):
+        current = origin
+        path: list[str] = []
+        positions: dict[str, int] = {}
+        while current in direct:
+            if current in positions:
+                cycle = set(path[positions[current]:])
+                for key in cycle:
+                    conflicts[key] = ("redirect_cycle", cycle)
+                break
+            positions[current] = len(path)
+            path.append(current)
+            current = direct[current]
+    return conflicts
+
+
+def _isolate_catalog_conflicts(
+    conn: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    key_by_id: dict[int, str],
+    display_by_key: dict[str, str],
+    redirects: dict[str, set[str]],
+) -> dict[str, tuple[str, set[str]]]:
+    """将冲突产品锁定在上一个稳定键，其他产品继续重建。"""
+    conflicts = _redirect_conflicts(conn, redirects)
+    if not conflicts:
+        return {}
+    now = datetime.now().astimezone().isoformat()
+    previous_names = {
+        row["canonical_key"]: row["name"]
+        for row in conn.execute("SELECT canonical_key,name FROM canonical_games")
+    }
+    for old_key, (reason, candidates) in conflicts.items():
+        affected = [row for row in rows if row["canonical_key"] == old_key]
+        if not affected:
+            continue
+        for row in affected:
+            key_by_id[row["id"]] = old_key
+        display_by_key[old_key] = previous_names.get(old_key) or min(
+            (clean_game_name(row["name"]) for row in affected),
+            key=lambda value: (len(value), value),
+        )
+        # 冲突键必须保持可用，不再同时作为历史跳转源。
+        conn.execute("DELETE FROM canonical_key_redirects WHERE old_key=?", (old_key,))
+        conn.execute(
+            """
+            INSERT INTO catalog_quarantine(
+              issue_key,reason,candidate_keys_json,source_row_ids_json,status,
+              first_detected_at,last_detected_at
+            ) VALUES (?,?,?,?,'active',?,?)
+            ON CONFLICT(issue_key) DO UPDATE SET
+              reason=excluded.reason,
+              candidate_keys_json=excluded.candidate_keys_json,
+              source_row_ids_json=excluded.source_row_ids_json,
+              status='active',
+              last_detected_at=excluded.last_detected_at
+            """,
+            (
+                old_key, reason,
+                json.dumps(sorted(candidates), ensure_ascii=False),
+                json.dumps(sorted(row["id"] for row in affected)),
+                now, now,
+            ),
+        )
+    return conflicts
+
+
 def _migrate_game_key_references(
     conn: sqlite3.Connection, redirects: dict[str, set[str]],
 ) -> dict[str, str]:
@@ -563,11 +652,14 @@ def _best(rows: list[sqlite3.Row], field: str):
     )[field]
 
 
-def rebuild_catalog(conn: sqlite3.Connection) -> int:
+def rebuild_catalog(conn: sqlite3.Connection, *, manage_transaction: bool = True) -> int:
     """从来源事件表重建可重复生成的跨渠道产品目录。"""
-    if conn.in_transaction:
-        raise RuntimeError("重建产品目录前存在未提交事务")
-    conn.execute("BEGIN IMMEDIATE")
+    if manage_transaction:
+        if conn.in_transaction:
+            raise RuntimeError("重建产品目录前存在未提交事务")
+        conn.execute("BEGIN IMMEDIATE")
+    elif not conn.in_transaction:
+        raise RuntimeError("外部事务模式下必须先开启事务")
     try:
         invalid_ids = []
         for row in conn.execute(
@@ -595,8 +687,18 @@ def rebuild_catalog(conn: sqlite3.Connection) -> int:
             for row in conn.execute("SELECT id,canonical_key FROM canonical_games")
         }
         key_by_id, display_by_key = _resolve_name_identities(rows)
-        groups: dict[str, list[sqlite3.Row]] = defaultdict(list)
         redirects: dict[str, set[str]] = defaultdict(set)
+        for row in rows:
+            key = key_by_id[row["id"]]
+            if row["canonical_key"]:
+                redirects[row["canonical_key"]].add(key)
+
+        conn.execute("UPDATE catalog_quarantine SET status='resolved' WHERE status='active'")
+        _isolate_catalog_conflicts(
+            conn, rows, key_by_id, display_by_key, redirects,
+        )
+        groups: dict[str, list[sqlite3.Row]] = defaultdict(list)
+        redirects = defaultdict(set)
         for row in rows:
             key = key_by_id[row["id"]]
             groups[key].append(row)
@@ -674,10 +776,12 @@ def rebuild_catalog(conn: sqlite3.Connection) -> int:
         conn.execute(
             "DELETE FROM canonical_games WHERE id NOT IN (SELECT DISTINCT game_id FROM canonical_members)"
         )
-        conn.commit()
+        if manage_transaction:
+            conn.commit()
         return len(groups)
     except Exception:
-        conn.rollback()
+        if manage_transaction:
+            conn.rollback()
         raise
 
 
