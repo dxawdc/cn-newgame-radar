@@ -24,7 +24,10 @@ test ! -e "$release_dir"
 
 # 发布制品在解包和执行前必须通过完整性校验。
 for artifact in release.tar.gz media_manifest.json apply_media_manifest.py validate_readiness.py; do
-  grep -Eq "^[0-9a-fA-F]{64} [ *]${artifact}$" "$incoming_dir/checksums.sha256"
+  awk '{print $2}' "$incoming_dir/checksums.sha256" \
+    | tr -d '\r' \
+    | sed 's/^\*//' \
+    | grep -Fxq "$artifact"
 done
 (cd "$incoming_dir" && sha256sum --check --strict checksums.sha256)
 
