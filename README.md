@@ -185,8 +185,8 @@ python -m newgame_monitor.cli `
 
 页面能力包括：
 
-- 默认使用“产品聚合”口径：按“规范化产品 + 事件类型”取当前渠道范围内的最早日期，同日多渠道合并为一张卡片；
-- “渠道明细”口径逐条展示原始渠道事件，同一产品可在不同渠道、不同日期重复出现；
+- 默认使用“产品聚合”口径：按稳定 `game_uuid` 聚合为一张产品卡片，事件类型只用于筛选和详情轨迹；
+- “渠道明细”按“稳定产品 + 渠道”聚合，同一产品在同一渠道只显示一张卡片；
 - 今日默认视图，支持本周、本月、全部和自定义日期；
 - 事件日历与日期筛选联动；
 - 按关键词、品类、开发/发行商、来源渠道和事件类型组合筛选；
@@ -203,12 +203,15 @@ python -m newgame_monitor.cli `
 | `GET` | `/api/summary` | 日/周/月/全库统计 |
 | `GET` | `/api/games` | 产品/渠道事件列表及组合筛选，`view=product\|channel` |
 | `GET` | `/api/games/{id}` | 产品详情与渠道事件 |
+| `GET` | `/api/v2/games/{game_uuid}` | 使用不可变产品 UUID 读取详情；旧 UUID 合并后自动重定向 |
 | `GET` | `/api/calendar` | 日期事件分布，支持与列表相同的维度及主要筛选参数 |
 | `GET` | `/api/filters` | 可选筛选项 |
 | `GET` | `/livez` | 进程存活检查，不依赖数据库 |
 | `GET` | `/readyz` | 必需渠道状态和新鲜度检查，未就绪返回 503 |
 | `GET` | `/api/health` | 脱敏的采集器和 pipeline 运行摘要 |
 | `GET` | `/api/internal/health` | 管理员可见的运行阶段与错误详情 |
+| `GET` | `/api/internal/model-v2/health` | 管理员可见的新旧模型双读一致性报告 |
+| `GET/PATCH` | `/api/admin/reviews` | 管理详情、图集和身份复核任务 |
 | `GET` | `/api/v1/favorites` | 使用个人 API Key 读取关注产品 |
 
 个人关注 API 示例：
@@ -224,6 +227,29 @@ curl -H "Authorization: Bearer ngr_your_api_key" \
 
 Windows 可使用任务计划程序执行 `scripts/run_daily.ps1`。需要模拟器与远端同步时，应从示例脚本复制为本机专用脚本，并通过环境变量或 Git 忽略的本地配置保存设备路径、SSH 别名和健康检查地址。
 
+## 第二阶段模型迁移
+
+迁移工具会先使用 SQLite Backup API 创建一致快照，再生成稳定 UUID、渠道 listing、快照、事件版本和复核队列。生产执行前应停止写入任务，并确保备份目录位于持久存储：
+
+```bash
+PYTHONPATH=src python scripts/migrate_phase2.py apply \
+  --db /var/lib/newgame-monitor/data/newgame_monitor.db \
+  --backup-dir /var/lib/newgame-monitor/backups
+
+PYTHONPATH=src python scripts/migrate_phase2.py audit \
+  --db /var/lib/newgame-monitor/data/newgame_monitor.db
+```
+
+如双读统计或业务验收失败，停止 Web 和采集写入后使用 apply 输出的快照回滚；回滚前工具还会再保存一份当前数据库：
+
+```bash
+PYTHONPATH=src python scripts/migrate_phase2.py rollback \
+  --db /var/lib/newgame-monitor/data/newgame_monitor.db \
+  --snapshot /var/lib/newgame-monitor/backups/phase2-YYYYMMDDTHHMMSS-xxxxxxxx.db
+```
+
+图标和图集下载默认只允许代码内列出的官方商店/CDN 域名，并拒绝内网 DNS、异常端口、跨域重定向、超大响应和超大像素。确需调整时可通过 `NEWGAME_TRUSTED_MEDIA_HOSTS` 提供完整的逗号分隔白名单；设置该变量会替换而不是追加默认清单。
+
 ## 测试
 
 ```powershell
@@ -231,7 +257,7 @@ $env:PYTHONPATH = (Resolve-Path .\src).Path
 python -m pytest -q
 ```
 
-测试覆盖渠道解析、事件日期、误分类过滤、跨渠道归并、字段补全、Icon/图集、账号权限、关注/API Key、同步包以及 Web API。
+测试覆盖渠道解析、事件日期、误分类过滤、稳定产品身份、事件版本、跨渠道归并、字段补全、安全媒体下载、账号权限、UUID 收藏/API Key、同步包、模型迁移回滚以及 Web API。
 
 ## 安全与合规
 

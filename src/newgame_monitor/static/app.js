@@ -150,8 +150,8 @@ function gameCard(game, index) {
   const laterEvents = state.dimension === 'product' && game.later_event_count
     ? `<p class="later-events">后续还有 <strong>${game.later_event_count}</strong> 个同类渠道事件，完整轨迹见详情</p>` : '';
   const followLabel = game.followed ? '已关注' : '＋ 关注';
-  return `<article class="game-card" data-id="${game.id}" data-key="${escapeHTML(game.key)}" data-index="${String(index+1).padStart(2,'0')}">
-    <button class="card-follow ${game.followed ? 'active' : ''}" type="button" data-follow-key="${escapeHTML(game.key)}" aria-pressed="${Boolean(game.followed)}">${followLabel}</button>
+  return `<article class="game-card" data-id="${game.id}" data-uuid="${escapeHTML(game.uuid)}" data-index="${String(index+1).padStart(2,'0')}">
+    <button class="card-follow ${game.followed ? 'active' : ''}" type="button" data-follow-key="${escapeHTML(game.uuid)}" aria-pressed="${Boolean(game.followed)}">${followLabel}</button>
     <div class="card-head">${icon}<div><div class="event-date"><i></i>${fmtDate(event.date)} · ${escapeHTML(dateNote)}</div>
     <h3>${escapeHTML(game.name)}</h3><p class="developer">${escapeHTML(game.developer || '开发商待补充')}</p></div></div>
     <p class="game-intro">${escapeHTML(game.intro || '该渠道暂未提供玩法介绍，已保留来源事件等待详情补全。')}</p>
@@ -181,7 +181,7 @@ async function loadGames() {
     const pages = Math.max(1, Math.ceil(data.total / state.pageSize));
     $('#pageInfo').textContent = `${state.page} / ${pages}`;
     $('#prevPage').disabled = state.page <= 1; $('#nextPage').disabled = state.page >= pages;
-    $$('.game-card').forEach(card => card.addEventListener('click', () => openDetail(card.dataset.id)));
+    $$('.game-card').forEach(card => card.addEventListener('click', () => openDetail(card.dataset.uuid)));
     $$('.card-follow').forEach(button => button.addEventListener('click', event => {
       event.stopPropagation(); toggleFavorite(button.dataset.followKey, button);
     }));
@@ -190,13 +190,13 @@ async function loadGames() {
   }
 }
 
-async function openDetail(id) {
+async function openDetail(gameUuid) {
   state.galleryResizeObserver?.disconnect();
   state.galleryResizeObserver = null;
-  state.currentDetailId = String(id);
+  state.currentDetailId = String(gameUuid);
   $('#drawerContent').innerHTML = '<p>正在读取产品档案…</p>';
   $('#detailDrawer').classList.add('open'); $('#detailDrawer').setAttribute('aria-hidden','false'); $('#filterBackdrop').classList.add('open');
-  const game = await api(`/api/games/${id}`);
+  const game = await api(`/api/v2/games/${encodeURIComponent(gameUuid)}`);
   const icon = game.icon_url ? `<img class="game-icon" src="${escapeHTML(game.icon_url)}" alt="${escapeHTML(game.name)} 图标">` : `<span class="icon-fallback">${escapeHTML(game.name.slice(0,1))}</span>`;
   const latestIntro = game.latest_intro || (game.intro ? {text: game.intro, source_label: '聚合资料'} : null);
   const introMeta = latestIntro?.collected_at ? `${escapeHTML(latestIntro.source_label)} · 最近采集 ${fmtTime(latestIntro.collected_at)}` : escapeHTML(latestIntro?.source_label || '');
@@ -213,7 +213,7 @@ async function openDetail(id) {
       <button class="gallery-nav gallery-next" type="button" aria-label="下一张"><img src="assets/icons/chevron-right.svg" alt=""></button>
       <div class="gallery-progress" aria-live="polite"><span>图集</span><strong data-gallery-current>1</strong><span>/${gallery.length}</span></div>
     </div></section>` : '';
-  $('#drawerContent').innerHTML = `<div class="drawer-hero">${icon}<div><p class="eyebrow">PRODUCT DOSSIER / ${game.source_count} SOURCES</p><h2>${escapeHTML(game.name)}</h2><p>${escapeHTML(game.developer || '开发商待补充')} · ${escapeHTML(game.category || '品类待补充')}</p><button class="drawer-follow ${game.followed ? 'active' : ''}" type="button" data-follow-key="${escapeHTML(game.key)}" aria-pressed="${Boolean(game.followed)}">${game.followed ? '已关注此游戏' : '＋ 添加关注'}</button></div></div>
+  $('#drawerContent').innerHTML = `<div class="drawer-hero">${icon}<div><p class="eyebrow">PRODUCT DOSSIER / ${game.source_count} SOURCES</p><h2>${escapeHTML(game.name)}</h2><p>${escapeHTML(game.developer || '开发商待补充')} · ${escapeHTML(game.category || '品类待补充')}</p><button class="drawer-follow ${game.followed ? 'active' : ''}" type="button" data-follow-key="${escapeHTML(game.uuid)}" aria-pressed="${Boolean(game.followed)}">${game.followed ? '已关注此游戏' : '＋ 添加关注'}</button></div></div>
     <p class="detail-follow-date" ${game.followed && game.last_followed_at ? '' : 'hidden'}>最近一次关注：<time>${escapeHTML(fmtFollowTime(game.last_followed_at))}</time></p>
     ${gallerySection}
     <section class="latest-intro ${latestIntro?.kind === 'full' ? 'is-full' : ''}"><div class="latest-intro-head"><div><span>GAME PROFILE</span><h3>${introTitle}</h3></div>${introLink}</div>
@@ -450,7 +450,7 @@ function refreshFollowButtons(gameKey, followed, lastFollowedAt = '') {
       ? (followed ? '已关注此游戏' : '＋ 添加关注')
       : (followed ? '已关注' : '＋ 关注');
   });
-  $$('.game-card').filter(card => card.dataset.key === gameKey).forEach(card => {
+  $$('.game-card').filter(card => card.dataset.uuid === gameKey).forEach(card => {
     const note = card.querySelector('.follow-date');
     if (!note) return;
     note.hidden = !followed;
@@ -473,8 +473,8 @@ async function toggleFavorite(gameKey, button) {
   button.disabled = true;
   try {
     const data = followed
-      ? await api('/api/favorites', {game_key:gameKey}, {method:'DELETE', csrf:true})
-      : await api('/api/favorites', {}, {method:'POST', csrf:true, body:{game_key:gameKey}});
+      ? await api('/api/favorites', {game_uuid:gameKey}, {method:'DELETE', csrf:true})
+      : await api('/api/favorites', {}, {method:'POST', csrf:true, body:{game_uuid:gameKey}});
     state.auth.favoriteCount = data.favorite_count;
     refreshFollowButtons(gameKey, data.followed, data.last_followed_at);
     renderAuth();

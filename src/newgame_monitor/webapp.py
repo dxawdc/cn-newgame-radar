@@ -20,7 +20,7 @@ from typing import Iterable
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .auth import (
     ROLES,
@@ -49,6 +49,10 @@ from .catalog import (
 )
 from .db import connect
 from .gallery import extract_gallery_urls, gallery_urls_from_rows
+from .phase2_model import (
+    CONTROLLED_EVENT_TYPES, audit_phase2_model, finish_review_job,
+    resolve_game_uuid,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -103,7 +107,8 @@ class ProfilePayload(BaseModel):
 
 
 class FavoritePayload(BaseModel):
-    game_key: str
+    game_uuid: str | None = None
+    game_key: str | None = None
 
 
 class ApiKeyCreatePayload(BaseModel):
@@ -123,6 +128,12 @@ class UserUpdatePayload(BaseModel):
     password: str | None = None
     role: str | None = None
     is_active: bool | None = None
+
+
+class ReviewUpdatePayload(BaseModel):
+    status: str
+    result: dict = Field(default_factory=dict)
+    next_retry_at: str | None = None
 
 
 def _session_context(request: Request, *, required: bool = True) -> dict | None:
@@ -156,13 +167,31 @@ def _permissions(user: dict) -> dict:
 def _favorite_dates(user_id: int) -> dict[str, str]:
     conn = _conn()
     try:
-        return {
-            row["game_key"]: row["last_followed_at"] or row["created_at"]
-            for row in conn.execute(
-                "SELECT game_key, created_at, last_followed_at FROM user_favorites WHERE user_id=?",
-                (user_id,),
-            )
-        }
+        result: dict[str, str] = {}
+        for row in conn.execute(
+            """
+            SELECT game_uuid,created_at,last_followed_at
+            FROM user_favorite_games WHERE user_id=?
+            """,
+            (user_id,),
+        ):
+            current_uuid = resolve_game_uuid(conn, row["game_uuid"])
+            if current_uuid:
+                followed_at = row["last_followed_at"] or row["created_at"]
+                result[current_uuid] = max(result.get(current_uuid, ""), followed_at)
+        # 兼容仍由旧客户端或迁移前脚本写入的名称键收藏。
+        for row in conn.execute(
+            """
+            SELECT g.game_uuid,f.created_at,f.last_followed_at
+            FROM user_favorites f
+            JOIN canonical_games g ON g.canonical_key=f.game_key
+            WHERE f.user_id=?
+            """,
+            (user_id,),
+        ):
+            followed_at = row["last_followed_at"] or row["created_at"]
+            result[row["game_uuid"]] = max(result.get(row["game_uuid"], ""), followed_at)
+        return result
     finally:
         conn.close()
 
@@ -229,7 +258,16 @@ def _event_date(row: sqlite3.Row) -> tuple[str, str]:
 
 def _effective_event_type(row: sqlite3.Row) -> str:
     """没有明确事件日期时，只能表示首次采集发现，不能冒充原事件已发生。"""
-    return row["event_type"] if _iso_date(row["event_time"]) else "first_seen"
+    if not _iso_date(row["event_time"]):
+        return "first_seen"
+    raw_type = row["event_type"]
+    if raw_type in EVENT_LABELS:
+        return raw_type
+    controlled = CONTROLLED_EVENT_TYPES.get(raw_type, "unknown")
+    return {
+        "test": "beta", "test_recruitment": "recruiting_beta",
+        "listing": "new_listing",
+    }.get(controlled, controlled)
 
 
 def _csv(values: list[str] | None) -> set[str]:
@@ -459,8 +497,11 @@ def _serialize(game: dict, members: Iterable[sqlite3.Row] | None = None) -> dict
         tags = json.loads(game["tags_json"] or "[]")
     except json.JSONDecodeError:
         tags = []
+    game_uuid = game.get("game_uuid") or game["canonical_key"]
     return {
         "id": game["id"],
+        "uuid": game_uuid,
+        "game_uuid": game_uuid,
         "key": game["canonical_key"],
         "name": game["name"],
         "developer": game["developer"],
@@ -862,6 +903,82 @@ def _admin_context(request: Request) -> dict:
     return context
 
 
+@app.get("/api/admin/reviews")
+def list_reviews(
+    request: Request, queue_type: str | None = None, status: str = "pending",
+    limit: int = Query(default=100, ge=1, le=200),
+):
+    _admin_context(request)
+    if queue_type and queue_type not in {"detail", "gallery", "identity"}:
+        raise HTTPException(status_code=422, detail="queue_type 不受支持")
+    if status not in {"pending", "processing", "retry", "resolved", "dismissed", "all"}:
+        raise HTTPException(status_code=422, detail="status 不受支持")
+    clauses, values = [], []
+    if queue_type:
+        clauses.append("q.queue_type=?")
+        values.append(queue_type)
+    if status != "all":
+        clauses.append("q.status=?")
+        values.append(status)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT q.*,g.name,pl.source,pl.source_item_id
+            FROM review_queue q
+            LEFT JOIN canonical_games g ON g.game_uuid=q.game_uuid
+            LEFT JOIN platform_listings pl ON pl.id=q.listing_id
+            {where}
+            ORDER BY q.priority DESC,q.updated_at,q.id LIMIT ?
+            """,
+            (*values, limit),
+        ).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            for field in ("evidence_json", "result_json"):
+                try:
+                    item[field.removesuffix("_json")] = json.loads(item.pop(field) or "{}")
+                except json.JSONDecodeError:
+                    item[field.removesuffix("_json")] = {}
+            items.append(item)
+        return {"total": len(items), "items": items}
+    finally:
+        conn.close()
+
+
+@app.patch("/api/admin/reviews/{review_id}")
+def update_review(review_id: int, payload: ReviewUpdatePayload, request: Request):
+    context = _admin_context(request)
+    _require_csrf(request, context)
+    conn = _conn()
+    try:
+        if not conn.execute("SELECT 1 FROM review_queue WHERE id=?", (review_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="复核任务不存在")
+        try:
+            finish_review_job(
+                conn, review_id, status=payload.status, result=payload.result,
+                next_retry_at=payload.next_retry_at,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        conn.commit()
+        return {"status": payload.status, "review_id": review_id}
+    finally:
+        conn.close()
+
+
+@app.get("/api/internal/model-v2/health")
+def model_v2_health(request: Request):
+    _admin_context(request)
+    conn = _conn()
+    try:
+        return audit_phase2_model(conn)
+    finally:
+        conn.close()
+
+
 def _assert_manageable(actor: dict, target: sqlite3.Row) -> None:
     if actor["id"] == target["id"]:
         raise HTTPException(status_code=400, detail="请在个人中心修改当前账号")
@@ -1012,55 +1129,90 @@ def delete_user(user_id: int, request: Request):
         conn.close()
 
 
+def _favorite_game(
+    conn: sqlite3.Connection, *, game_uuid: str | None = None,
+    game_key: str | None = None,
+) -> sqlite3.Row | None:
+    if game_uuid:
+        current_uuid = resolve_game_uuid(conn, game_uuid)
+        if current_uuid:
+            return conn.execute(
+                "SELECT * FROM canonical_games WHERE game_uuid=?", (current_uuid,)
+            ).fetchone()
+    current_key = (game_key or "").strip()
+    for _ in range(16):
+        if not current_key:
+            break
+        row = conn.execute(
+            "SELECT * FROM canonical_games WHERE canonical_key=?", (current_key,)
+        ).fetchone()
+        if row:
+            return row
+        redirect = conn.execute(
+            "SELECT new_key FROM canonical_key_redirects WHERE old_key=?", (current_key,)
+        ).fetchone()
+        if not redirect or redirect[0] == current_key:
+            break
+        current_key = redirect[0]
+    return None
+
+
 @app.post("/api/favorites")
 def add_favorite(payload: FavoritePayload, request: Request):
     context = _session_context(request)
     _require_csrf(request, context)
     conn = _conn()
     try:
-        game_key = payload.game_key
-        for _ in range(5):
-            redirect = conn.execute(
-                "SELECT new_key FROM canonical_key_redirects WHERE old_key=?", (game_key,)
-            ).fetchone()
-            if not redirect or redirect[0] == game_key:
-                break
-            game_key = redirect[0]
-        exists = conn.execute(
-            "SELECT 1 FROM canonical_games WHERE canonical_key=?", (game_key,)
-        ).fetchone()
-        if not exists:
+        game = _favorite_game(
+            conn, game_uuid=payload.game_uuid, game_key=payload.game_key,
+        )
+        if not game:
             raise HTTPException(status_code=404, detail="游戏不存在")
+        game_key = game["canonical_key"]
+        game_uuid = game["game_uuid"]
         followed_at = now_iso()
         existing = conn.execute(
-            "SELECT 1 FROM user_favorites WHERE user_id=? AND game_key=?",
-            (context["user"]["id"], game_key),
+            "SELECT 1 FROM user_favorite_games WHERE user_id=? AND game_uuid=?",
+            (context["user"]["id"], game_uuid),
         ).fetchone()
         if not existing:
             conn.execute(
                 """
-                INSERT INTO user_favorites(user_id, game_key, created_at, last_followed_at)
+                INSERT INTO user_favorite_games(
+                  user_id,game_uuid,legacy_game_key,created_at,last_followed_at
+                ) VALUES (?,?,?,?,?)
+                """,
+                (context["user"]["id"], game_uuid, game_key, followed_at, followed_at),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO user_favorites(
+                  user_id, game_key, created_at, last_followed_at
+                )
                 VALUES (?, ?, ?, ?)
                 """,
                 (context["user"]["id"], game_key, followed_at, followed_at),
             )
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO favorite_activity_logs(user_id, game_key, action, occurred_at)
                 VALUES (?, ?, 'follow', ?)
                 """,
                 (context["user"]["id"], game_key, followed_at),
             )
+            conn.execute(
+                "INSERT INTO favorite_activity_game_ids(activity_log_id,game_uuid) VALUES (?,?)",
+                (cursor.lastrowid, game_uuid),
+            )
         conn.commit()
-        count = conn.execute(
-            "SELECT COUNT(*) FROM user_favorites WHERE user_id=?", (context["user"]["id"],)
-        ).fetchone()[0]
         current = conn.execute(
-            "SELECT last_followed_at FROM user_favorites WHERE user_id=? AND game_key=?",
-            (context["user"]["id"], game_key),
+            "SELECT last_followed_at FROM user_favorite_games WHERE user_id=? AND game_uuid=?",
+            (context["user"]["id"], game_uuid),
         ).fetchone()
         return {
-            "followed": True, "favorite_count": count,
+            "followed": True,
+            "favorite_count": len(_favorite_dates(context["user"]["id"])),
+            "game_uuid": game_uuid,
             "last_followed_at": current[0] if current else followed_at,
         }
     finally:
@@ -1068,35 +1220,49 @@ def add_favorite(payload: FavoritePayload, request: Request):
 
 
 @app.delete("/api/favorites")
-def remove_favorite(game_key: str, request: Request):
+def remove_favorite(
+    request: Request, game_uuid: str | None = None, game_key: str | None = None,
+):
     context = _session_context(request)
     _require_csrf(request, context)
     conn = _conn()
     try:
-        for _ in range(5):
-            redirect = conn.execute(
-                "SELECT new_key FROM canonical_key_redirects WHERE old_key=?", (game_key,)
-            ).fetchone()
-            if not redirect or redirect[0] == game_key:
-                break
-            game_key = redirect[0]
-        cursor = conn.execute(
-            "DELETE FROM user_favorites WHERE user_id=? AND game_key=?",
-            (context["user"]["id"], game_key),
+        game = _favorite_game(conn, game_uuid=game_uuid, game_key=game_key)
+        if not game:
+            raise HTTPException(status_code=404, detail="游戏不存在")
+        current_uuid = game["game_uuid"]
+        current_key = game["canonical_key"]
+        uuid_family = {current_uuid, (game_uuid or "").strip().lower()}
+        for row in conn.execute("SELECT old_game_uuid FROM canonical_game_uuid_redirects"):
+            if resolve_game_uuid(conn, row[0]) == current_uuid:
+                uuid_family.add(row[0])
+        placeholders = ",".join("?" for _ in uuid_family)
+        stable_cursor = conn.execute(
+            f"DELETE FROM user_favorite_games WHERE user_id=? AND game_uuid IN ({placeholders})",
+            (context["user"]["id"], *sorted(uuid_family)),
         )
-        if cursor.rowcount:
-            conn.execute(
+        legacy_cursor = conn.execute(
+            "DELETE FROM user_favorites WHERE user_id=? AND game_key=?",
+            (context["user"]["id"], current_key),
+        )
+        if stable_cursor.rowcount or legacy_cursor.rowcount:
+            cursor = conn.execute(
                 """
                 INSERT INTO favorite_activity_logs(user_id, game_key, action, occurred_at)
                 VALUES (?, ?, 'unfollow', ?)
                 """,
-                (context["user"]["id"], game_key, now_iso()),
+                (context["user"]["id"], current_key, now_iso()),
+            )
+            conn.execute(
+                "INSERT INTO favorite_activity_game_ids(activity_log_id,game_uuid) VALUES (?,?)",
+                (cursor.lastrowid, current_uuid),
             )
         conn.commit()
-        count = conn.execute(
-            "SELECT COUNT(*) FROM user_favorites WHERE user_id=?", (context["user"]["id"],)
-        ).fetchone()[0]
-        return {"followed": False, "favorite_count": count}
+        return {
+            "followed": False,
+            "favorite_count": len(_favorite_dates(context["user"]["id"])),
+            "game_uuid": current_uuid,
+        }
     finally:
         conn.close()
 
@@ -1107,20 +1273,38 @@ def _csv_safe(value) -> str:
 
 
 def _favorite_products(conn: sqlite3.Connection, user_id: int) -> list[dict]:
-    favorite_rows = conn.execute(
+    favorite_rows = list(conn.execute(
         """
-        SELECT game_key, created_at, last_followed_at
-        FROM user_favorites WHERE user_id=?
+        SELECT game_uuid,legacy_game_key AS game_key,created_at,last_followed_at
+        FROM user_favorite_games WHERE user_id=?
         ORDER BY last_followed_at DESC
         """,
         (user_id,),
-    ).fetchall()
-    games_by_key = {game["canonical_key"]: game for game in _load_catalog(conn)}
+    ))
+    catalog = _load_catalog(conn)
+    games_by_uuid = {game["game_uuid"]: game for game in catalog}
+    stable_keys = {
+        resolve_game_uuid(conn, row["game_uuid"]) for row in favorite_rows
+    }
+    for row in conn.execute(
+        """
+        SELECT g.game_uuid,f.game_key,f.created_at,f.last_followed_at
+        FROM user_favorites f
+        JOIN canonical_games g ON g.canonical_key=f.game_key
+        WHERE f.user_id=? ORDER BY f.last_followed_at DESC
+        """,
+        (user_id,),
+    ):
+        if row["game_uuid"] not in stable_keys:
+            favorite_rows.append(row)
     items = []
+    emitted: set[str] = set()
     for favorite in favorite_rows:
-        game = games_by_key.get(favorite["game_key"])
-        if not game:
+        current_uuid = resolve_game_uuid(conn, favorite["game_uuid"])
+        game = games_by_uuid.get(current_uuid)
+        if not game or current_uuid in emitted:
             continue
+        emitted.add(current_uuid)
         payload = _serialize(game)
         payload["latest_intro"] = _latest_game_intro(game)
         payload["followed"] = True
@@ -1209,16 +1393,16 @@ def games(
     if followed and not context:
         raise HTTPException(status_code=401, detail="登录后才能查看已关注列表")
     favorite_dates = _favorite_dates(context["user"]["id"]) if context else {}
-    favorite_keys = set(favorite_dates)
+    favorite_uuids = set(favorite_dates)
     items = _filtered_games(
         period, anchor, date_from, date_to, _csv(source), _csv(category),
         _csv(developer), _event_scope(event_type), q, view,
     )
     if followed:
-        items = [item for item in items if item["key"] in favorite_keys]
+        items = [item for item in items if item["uuid"] in favorite_uuids]
     for item in items:
-        item["followed"] = item["key"] in favorite_keys
-        item["last_followed_at"] = favorite_dates.get(item["key"])
+        item["followed"] = item["uuid"] in favorite_uuids
+        item["last_followed_at"] = favorite_dates.get(item["uuid"])
     reverse = sort not in {"event_asc", "name_asc"}
     if sort == "name_asc":
         items.sort(key=lambda x: x["name"])
@@ -1230,7 +1414,7 @@ def games(
             reverse=reverse,
         )
     total = len(items)
-    product_total = len({item["key"] for item in items})
+    product_total = len({item["uuid"] for item in items})
     start = (page - 1) * page_size
     return {
         "view": view, "total": total, "product_total": product_total,
@@ -1252,8 +1436,33 @@ def game_detail(game_id: int, request: Request):
             return {"error": "not_found"}
         payload = _serialize(game)
         payload["latest_intro"] = _latest_game_intro(game)
-        payload["followed"] = payload["key"] in favorite_dates
-        payload["last_followed_at"] = favorite_dates.get(payload["key"])
+        payload["followed"] = payload["uuid"] in favorite_dates
+        payload["last_followed_at"] = favorite_dates.get(payload["uuid"])
+        return payload
+    finally:
+        conn.close()
+
+
+@app.get("/api/v2/games/{game_uuid}")
+def game_detail_by_uuid(game_uuid: str, request: Request):
+    """稳定产品 ID 详情接口；合并后的旧 UUID 会安全跟随重定向。"""
+    context = _session_context(request, required=False)
+    favorite_dates = _favorite_dates(context["user"]["id"]) if context else {}
+    conn = _conn()
+    try:
+        current_uuid = resolve_game_uuid(conn, game_uuid)
+        if not current_uuid:
+            return {"error": "not_found"}
+        game = next(
+            (item for item in _load_catalog(conn) if item["game_uuid"] == current_uuid),
+            None,
+        )
+        if not game:
+            return {"error": "not_found"}
+        payload = _serialize(game)
+        payload["latest_intro"] = _latest_game_intro(game)
+        payload["followed"] = current_uuid in favorite_dates
+        payload["last_followed_at"] = favorite_dates.get(current_uuid)
         return payload
     finally:
         conn.close()
@@ -1305,14 +1514,10 @@ def filters():
             "SELECT developer FROM canonical_games WHERE developer IS NOT NULL AND developer<>'' GROUP BY developer ORDER BY COUNT(*) DESC, developer LIMIT 100"
         )]
         present_sources = {row[0] for row in conn.execute("SELECT DISTINCT source FROM source_items")}
-        present_events = {row[0] for row in conn.execute(
-            """
-            SELECT DISTINCT CASE
-                WHEN trim(COALESCE(event_time, ''))='' THEN 'first_seen'
-                ELSE event_type END
-            FROM source_items
-            """
-        )}
+        present_events = {
+            _effective_event_type(row)
+            for row in conn.execute("SELECT event_type,event_time FROM source_items")
+        }
     finally:
         conn.close()
     return {

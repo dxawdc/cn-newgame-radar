@@ -10,8 +10,9 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-import requests
 from PIL import Image
+
+from .safe_download import download_bytes
 
 
 HEADERS = {
@@ -138,11 +139,11 @@ def gallery_urls_from_rows(rows) -> list[tuple[str, str]]:
 def _download(url: str, screenshot_dir: Path) -> dict:
     now = datetime.now().astimezone().isoformat()
     try:
-        response = requests.get(url, headers=HEADERS, timeout=25)
-        response.raise_for_status()
-        if len(response.content) > 15 * 1024 * 1024:
-            raise ValueError("图片超过 15MB 限制")
-        image = Image.open(BytesIO(response.content))
+        downloaded = download_bytes(
+            url, headers=HEADERS, max_bytes=15 * 1024 * 1024,
+            validate_image=True, max_pixels=40_000_000, max_dimension=12_000,
+        )
+        image = Image.open(BytesIO(downloaded.content))
         image.seek(0)
         image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
         if image.mode not in ("RGB", "RGBA"):
@@ -153,7 +154,7 @@ def _download(url: str, screenshot_dir: Path) -> dict:
         image.save(target, "WEBP", quality=84, method=4)
         return {
             "source_url": url, "relative_path": relative.as_posix(), "status": "success",
-            "http_status": response.status_code, "content_type": response.headers.get("content-type"),
+            "http_status": downloaded.status_code, "content_type": downloaded.content_type,
             "byte_size": target.stat().st_size, "updated_at": now, "error": None,
         }
     except Exception as exc:

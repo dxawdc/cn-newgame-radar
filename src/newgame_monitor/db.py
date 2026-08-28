@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import uuid
 from pathlib import Path
 
 
@@ -92,6 +93,7 @@ CREATE TABLE IF NOT EXISTS applied_bundles (
 );
 CREATE TABLE IF NOT EXISTS canonical_games (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_uuid TEXT NOT NULL UNIQUE,
     canonical_key TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     normalized_name TEXT NOT NULL,
@@ -140,6 +142,17 @@ CREATE TABLE IF NOT EXISTS canonical_game_id_redirects (
 
 CREATE INDEX IF NOT EXISTS idx_canonical_game_id_redirects_new
 ON canonical_game_id_redirects(new_game_id);
+
+CREATE TABLE IF NOT EXISTS canonical_game_uuid_redirects (
+    old_game_uuid TEXT PRIMARY KEY,
+    new_game_uuid TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    CHECK (old_game_uuid <> new_game_uuid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_canonical_game_uuid_redirects_new
+ON canonical_game_uuid_redirects(new_game_uuid);
 
 CREATE TABLE IF NOT EXISTS catalog_quarantine (
     issue_key TEXT PRIMARY KEY,
@@ -268,6 +281,223 @@ CREATE TABLE IF NOT EXISTS user_api_keys (
 
 CREATE INDEX IF NOT EXISTS idx_user_api_keys_user
 ON user_api_keys(user_id, revoked_at, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS user_favorite_games (
+    user_id INTEGER NOT NULL,
+    game_uuid TEXT NOT NULL,
+    legacy_game_key TEXT,
+    created_at TEXT NOT NULL,
+    last_followed_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, game_uuid),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_favorite_games_uuid
+ON user_favorite_games(game_uuid);
+
+CREATE TABLE IF NOT EXISTS favorite_activity_game_ids (
+    activity_log_id INTEGER PRIMARY KEY,
+    game_uuid TEXT NOT NULL,
+    FOREIGN KEY (activity_log_id) REFERENCES favorite_activity_logs(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS platform_listings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_uuid TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_item_id TEXT NOT NULL,
+    package_name TEXT,
+    detail_url TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    UNIQUE(source, source_item_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_platform_listings_game
+ON platform_listings(game_uuid);
+
+CREATE TABLE IF NOT EXISTS game_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_uuid TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    normalized_alias TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    UNIQUE(game_uuid, normalized_alias, source)
+);
+
+CREATE INDEX IF NOT EXISTS idx_game_aliases_lookup
+ON game_aliases(normalized_alias, status);
+
+CREATE TABLE IF NOT EXISTS identity_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_uuid TEXT NOT NULL,
+    listing_id INTEGER,
+    source_row_id INTEGER,
+    evidence_type TEXT NOT NULL,
+    evidence_value TEXT NOT NULL,
+    normalized_value TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    observed_at TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(game_uuid, evidence_type, normalized_value, source_row_id),
+    FOREIGN KEY (listing_id) REFERENCES platform_listings(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_row_id) REFERENCES source_items(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_identity_evidence_lookup
+ON identity_evidence(evidence_type, normalized_value);
+
+CREATE TABLE IF NOT EXISTS identity_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    left_game_uuid TEXT NOT NULL,
+    right_game_uuid TEXT NOT NULL,
+    normalized_alias TEXT NOT NULL,
+    score REAL NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'pending',
+    first_detected_at TEXT NOT NULL,
+    last_detected_at TEXT NOT NULL,
+    resolution_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(left_game_uuid, right_game_uuid, normalized_alias)
+);
+
+CREATE INDEX IF NOT EXISTS idx_identity_candidates_status
+ON identity_candidates(status, score DESC);
+
+CREATE TABLE IF NOT EXISTS listing_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    listing_id INTEGER NOT NULL,
+    source_row_id INTEGER NOT NULL,
+    observed_at TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    name TEXT NOT NULL,
+    status TEXT,
+    raw_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(listing_id, payload_sha256),
+    FOREIGN KEY (listing_id) REFERENCES platform_listings(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_row_id) REFERENCES source_items(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_listing_snapshots_listing_time
+ON listing_snapshots(listing_id, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS release_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_uuid TEXT NOT NULL,
+    listing_id INTEGER NOT NULL,
+    event_identity TEXT NOT NULL UNIQUE,
+    raw_event_type TEXT NOT NULL,
+    controlled_event_type TEXT NOT NULL,
+    announced_at TEXT,
+    scheduled_at TEXT,
+    actual_at TEXT,
+    status TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    FOREIGN KEY (listing_id) REFERENCES platform_listings(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_release_events_game_time
+ON release_events(game_uuid, scheduled_at);
+
+CREATE TABLE IF NOT EXISTS event_schedule_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    release_event_id INTEGER NOT NULL,
+    source_row_id INTEGER NOT NULL,
+    scheduled_at TEXT NOT NULL DEFAULT '',
+    event_end_at TEXT NOT NULL DEFAULT '',
+    date_precision TEXT NOT NULL DEFAULT 'unknown',
+    observed_at TEXT NOT NULL,
+    change_reason TEXT NOT NULL DEFAULT 'observed',
+    UNIQUE(release_event_id, source_row_id, scheduled_at, event_end_at),
+    FOREIGN KEY (release_event_id) REFERENCES release_events(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_row_id) REFERENCES source_items(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_schedule_versions_event
+ON event_schedule_versions(release_event_id, observed_at);
+
+CREATE TABLE IF NOT EXISTS test_rounds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    release_event_id INTEGER NOT NULL UNIQUE,
+    round_key TEXT NOT NULL,
+    round_index INTEGER,
+    recruitment_at TEXT,
+    starts_at TEXT,
+    ends_at TEXT,
+    reset_policy TEXT,
+    billing_policy TEXT,
+    status TEXT,
+    FOREIGN KEY (release_event_id) REFERENCES release_events(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS event_type_quarantine (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_row_id INTEGER NOT NULL UNIQUE,
+    raw_event_type TEXT NOT NULL,
+    suggested_type TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    first_detected_at TEXT NOT NULL,
+    last_detected_at TEXT NOT NULL,
+    resolution_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (source_row_id) REFERENCES source_items(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_type_quarantine_status
+ON event_type_quarantine(status, last_detected_at DESC);
+
+CREATE TABLE IF NOT EXISTS review_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_key TEXT NOT NULL UNIQUE,
+    queue_type TEXT NOT NULL CHECK(queue_type IN ('detail','gallery','identity')),
+    game_uuid TEXT NOT NULL,
+    listing_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'pending',
+    priority INTEGER NOT NULL DEFAULT 50,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TEXT,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT NOT NULL DEFAULT '{}',
+    first_detected_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    resolved_at TEXT,
+    FOREIGN KEY (listing_id) REFERENCES platform_listings(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_queue_work
+ON review_queue(status, next_retry_at, priority DESC, updated_at);
+
+CREATE TABLE IF NOT EXISTS media_assets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_uuid TEXT NOT NULL,
+    listing_id INTEGER,
+    asset_type TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    relative_path TEXT,
+    status TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(game_uuid, asset_type, source_url),
+    FOREIGN KEY (listing_id) REFERENCES platform_listings(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_media_assets_game_type
+ON media_assets(game_uuid, asset_type, status);
+
+CREATE TABLE IF NOT EXISTS model_migration_runs (
+    migration_id TEXT PRIMARY KEY,
+    model_version INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL,
+    snapshot_path TEXT,
+    audit_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT
+);
 """
 
 
@@ -293,10 +523,37 @@ def connect(path: Path) -> sqlite3.Connection:
         conn.execute("ALTER TABLE collection_runs ADD COLUMN run_group_id TEXT")
     if "metrics_json" not in run_columns:
         conn.execute("ALTER TABLE collection_runs ADD COLUMN metrics_json TEXT NOT NULL DEFAULT '{}'")
+    game_columns = {row["name"] for row in conn.execute("PRAGMA table_info(canonical_games)")}
+    if "game_uuid" not in game_columns:
+        conn.execute("ALTER TABLE canonical_games ADD COLUMN game_uuid TEXT")
+    for row in conn.execute(
+        "SELECT id,canonical_key FROM canonical_games WHERE game_uuid IS NULL OR trim(game_uuid)=''"
+    ):
+        stable_uuid = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"https://newgame-monitor.local/legacy/{row['id']}/{row['canonical_key']}",
+        ))
+        conn.execute(
+            "UPDATE canonical_games SET game_uuid=? WHERE id=?", (stable_uuid, row["id"])
+        )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_games_uuid ON canonical_games(game_uuid)"
+    )
     favorite_columns = {row["name"] for row in conn.execute("PRAGMA table_info(user_favorites)")}
     if "last_followed_at" not in favorite_columns:
         conn.execute("ALTER TABLE user_favorites ADD COLUMN last_followed_at TEXT")
         conn.execute("UPDATE user_favorites SET last_followed_at=created_at WHERE last_followed_at IS NULL")
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO user_favorite_games(
+          user_id,game_uuid,legacy_game_key,created_at,last_followed_at
+        )
+        SELECT f.user_id,g.game_uuid,f.game_key,f.created_at,
+          COALESCE(f.last_followed_at,f.created_at)
+        FROM user_favorites f
+        JOIN canonical_games g ON g.canonical_key=f.game_key
+        """
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_source_items_canonical_key ON source_items(canonical_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_source_items_updated_at ON source_items(updated_at)")
     # 变更日志既覆盖常规 upsert，也覆盖详情补全、历史修复和显式删除。

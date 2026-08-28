@@ -103,6 +103,60 @@ class AuthApiTest(unittest.TestCase):
         self.client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf})
         self.login(password="new-gdc-123456")
 
+    def test_uuid_api_and_favorite_survive_product_rename(self):
+        csrf = self.login()
+        self.seed_game()
+        listed = self.client.get("/api/games", params={"period": "all"}).json()
+        game_uuid = listed["items"][0]["uuid"]
+        detail = self.client.get(f"/api/v2/games/{game_uuid}")
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["uuid"], game_uuid)
+        followed = self.client.post(
+            "/api/favorites", json={"game_uuid": game_uuid},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(followed.status_code, 200, followed.text)
+        self.assertEqual(followed.json()["game_uuid"], game_uuid)
+
+        conn = connect(webapp.DB_PATH)
+        conn.execute("UPDATE source_items SET name='关注测试新游重命名'")
+        conn.commit()
+        rebuild_catalog(conn)
+        stable = conn.execute(
+            "SELECT game_uuid FROM canonical_games"
+        ).fetchone()[0]
+        favorite_uuid = conn.execute(
+            "SELECT game_uuid FROM user_favorite_games"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(stable, game_uuid)
+        self.assertEqual(favorite_uuid, game_uuid)
+        favorites = self.client.get(
+            "/api/games", params={"period": "all", "followed": "true"},
+        ).json()
+        self.assertEqual(favorites["total"], 1)
+        self.assertEqual(favorites["items"][0]["uuid"], game_uuid)
+        self.assertEqual(favorites["items"][0]["name"], "关注测试新游重命名")
+
+    def test_admin_can_review_phase2_gaps_and_read_model_health(self):
+        csrf = self.login()
+        self.seed_game()
+        reviews = self.client.get(
+            "/api/admin/reviews", params={"queue_type": "gallery", "status": "pending"},
+        )
+        self.assertEqual(reviews.status_code, 200, reviews.text)
+        self.assertEqual(reviews.json()["total"], 1)
+        review_id = reviews.json()["items"][0]["id"]
+        updated = self.client.patch(
+            f"/api/admin/reviews/{review_id}",
+            json={"status": "resolved", "result": {"reason": "manual_verified"}},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        health = self.client.get("/api/internal/model-v2/health")
+        self.assertEqual(health.status_code, 200, health.text)
+        self.assertEqual(health.json()["status"], "ok")
+
     def test_admin_can_manage_users_but_not_admins(self):
         csrf = self.login()
         admin = self.client.post(

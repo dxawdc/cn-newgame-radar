@@ -15,6 +15,25 @@ from newgame_monitor.enrichment import _find_taptap_detail_content
 
 
 class WebAppTest(unittest.TestCase):
+    def test_unknown_event_type_is_exposed_for_quarantine_review(self):
+        member = {
+            "source": "taptap", "event_type": "mystery_event",
+            "event_time": "2026-09-01", "event_end_time": "",
+            "status": "待识别活动", "detail_url": None,
+            "first_seen_at": "2026-08-28T10:00:00+08:00", "raw_json": "{}",
+        }
+        game = {
+            "id": 1, "canonical_key": "name:未知事件新游", "name": "未知事件新游",
+            "developer": "样例公司", "category": "策略", "tags_json": "[]",
+            "gameplay_intro": "样例介绍", "icon_url": "", "rating": None,
+            "first_seen_at": member["first_seen_at"], "last_seen_at": member["first_seen_at"],
+            "members": [member],
+        }
+        payload = _serialize(game)
+        self.assertEqual(_effective_event_type(member), "unknown")
+        self.assertEqual(payload["events"][0]["type"], "unknown")
+        self.assertEqual(payload["events"][0]["type_label"], "待分类事件")
+
     def test_undated_launch_is_exposed_as_first_seen(self):
         member = {
             "source": "uc_9game", "event_type": "launch", "event_time": "",

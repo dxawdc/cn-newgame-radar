@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 import unicodedata
+import uuid
 from collections import defaultdict
 from datetime import datetime
 
@@ -40,6 +42,9 @@ EVENT_LABELS = {
     "pre_download": "预下载",
     "timeline": "新游动态",
     "new_listing": "新收录",
+    "update": "版本更新",
+    "promotion": "促销活动",
+    "unknown": "待分类事件",
     "first_seen": "首次采集发现",
 }
 
@@ -228,6 +233,13 @@ def _structural_base_candidates(name: str) -> list[tuple[str, str, str]]:
     )
 
 
+def identity_candidate_names(name: str) -> list[str]:
+    """返回身份候选召回键；只用于产生候选，不直接决定产品合并。"""
+    candidates = [normalize_game_name(name)]
+    candidates.extend(item[0] for item in _structural_base_candidates(name))
+    return list(dict.fromkeys(value for value in candidates if value))
+
+
 def _package_family(value: str | None) -> str:
     package = (value or "").strip().casefold()
     for suffix in (
@@ -368,6 +380,46 @@ def _resolve_name_identities(
         row["id"]: canonical_key_for(row["name"], row["package_name"])
         for row in rows
     }
+    initial_groups: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for row in rows:
+        initial_groups[current_by_id[row["id"]]].append(row)
+    for base_key, members in initial_groups.items():
+        package_values = {
+            _package_family(row["package_name"])
+            for row in members if _package_family(row["package_name"])
+        }
+        developer_values = {
+            _normalized_party(row["developer"])
+            for row in members if _normalized_party(row["developer"])
+        }
+        # 同名本身只负责召回。仅当包名族和开发主体同时给出相互矛盾的
+        # 强佐证时拆分实体；证据不足的情况保留并进入后续身份复核队列。
+        if len(package_values) < 2 or len(developer_values) < 2:
+            continue
+        if any(
+            not _package_family(row["package_name"]) or not _normalized_party(row["developer"])
+            for row in members
+        ):
+            continue
+        packages_by_developer: dict[str, set[str]] = defaultdict(set)
+        for row in members:
+            packages_by_developer[_normalized_party(row["developer"])].add(
+                _package_family(row["package_name"])
+            )
+        if any(
+            left_packages & right_packages
+            for left, left_packages in packages_by_developer.items()
+            for right, right_packages in packages_by_developer.items()
+            if left < right
+        ):
+            continue
+        for row in members:
+            fingerprint = "|".join((
+                _normalized_party(row["developer"]),
+                _package_family(row["package_name"]),
+            ))
+            suffix = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:12]
+            current_by_id[row["id"]] = f"{base_key}#identity:{suffix}"
     observed_keys = set(current_by_id.values())
     rows_by_key: dict[str, list[sqlite3.Row]] = defaultdict(list)
     candidates_by_key: dict[str, dict[str, tuple[str, str, bool]]] = defaultdict(dict)
@@ -452,9 +504,16 @@ def _redirect_conflicts(
         row["old_key"]: row["new_key"]
         for row in conn.execute("SELECT old_key,new_key FROM canonical_key_redirects")
     }
+    existing_keys = {
+        row[0] for row in conn.execute("SELECT canonical_key FROM canonical_games")
+    }
+    existing_keys.update(
+        row[0] for row in conn.execute("SELECT DISTINCT game_key FROM user_favorites")
+    )
     for old_key, targets in redirects.items():
         if len(targets) > 1:
-            conflicts[old_key] = ("one_to_many_split", set(targets))
+            if old_key in existing_keys:
+                conflicts[old_key] = ("one_to_many_split", set(targets))
             continue
         if len(targets) == 1:
             target = next(iter(targets))
@@ -638,6 +697,41 @@ def _record_game_id_redirects(
         )
 
 
+def _record_game_uuid_redirects(
+    conn: sqlite3.Connection, redirects: dict[str, str],
+) -> None:
+    """记录稳定 UUID 的合并关系，并把历史链压平到当前产品。"""
+    direct = {
+        row["old_game_uuid"]: row["new_game_uuid"]
+        for row in conn.execute(
+            "SELECT old_game_uuid,new_game_uuid FROM canonical_game_uuid_redirects"
+        )
+    }
+    direct.update({old: new for old, new in redirects.items() if old != new})
+    flattened: dict[str, str] = {}
+    for origin in sorted(direct):
+        current = origin
+        seen: set[str] = set()
+        while current in direct:
+            if current in seen or not direct[current] or direct[current] == current:
+                raise RuntimeError(f"产品 UUID 重定向出现环或自环：{origin}")
+            seen.add(current)
+            current = direct[current]
+        flattened[origin] = current
+    migrated_at = datetime.now().astimezone().isoformat()
+    for old_uuid, new_uuid in flattened.items():
+        conn.execute(
+            """
+            INSERT INTO canonical_game_uuid_redirects(
+              old_game_uuid,new_game_uuid,reason,created_at
+            ) VALUES (?,?,'identity_merge',?)
+            ON CONFLICT(old_game_uuid) DO UPDATE SET
+              new_game_uuid=excluded.new_game_uuid,reason=excluded.reason
+            """,
+            (old_uuid, new_uuid, migrated_at),
+        )
+
+
 def _best(rows: list[sqlite3.Row], field: str):
     candidates = [row for row in rows if row[field] not in (None, "", "[]")]
     if not candidates:
@@ -682,9 +776,27 @@ def rebuild_catalog(conn: sqlite3.Connection, *, manage_transaction: bool = True
             )
 
         rows = list(conn.execute("SELECT * FROM source_items ORDER BY id"))
+        previous_games = list(conn.execute(
+            "SELECT id,game_uuid,canonical_key FROM canonical_games"
+        ))
         previous_game_ids = {
-            row["canonical_key"]: row["id"]
-            for row in conn.execute("SELECT id,canonical_key FROM canonical_games")
+            row["canonical_key"]: row["id"] for row in previous_games
+        }
+        previous_uuid_by_key = {
+            row["canonical_key"]: row["game_uuid"] for row in previous_games
+        }
+        previous_uuid_rank = {
+            row["game_uuid"]: row["id"] for row in previous_games
+        }
+        previous_uuid_by_source_row = {
+            row["source_row_id"]: row["game_uuid"]
+            for row in conn.execute(
+                """
+                SELECT cm.source_row_id,cg.game_uuid
+                FROM canonical_members cm
+                JOIN canonical_games cg ON cg.id=cm.game_id
+                """
+            )
         }
         key_by_id, display_by_key = _resolve_name_identities(rows)
         redirects: dict[str, set[str]] = defaultdict(set)
@@ -705,9 +817,21 @@ def rebuild_catalog(conn: sqlite3.Connection, *, manage_transaction: bool = True
             if row["canonical_key"]:
                 redirects[row["canonical_key"]].add(key)
 
-        key_redirects = _migrate_game_key_references(conn, redirects)
+        previous_keys = set(previous_game_ids)
+        previous_keys.update(
+            row[0] for row in conn.execute("SELECT DISTINCT game_key FROM user_favorites")
+        )
+        previous_keys.update(
+            row[0] for row in conn.execute("SELECT DISTINCT game_key FROM favorite_activity_logs")
+        )
+        reference_redirects = defaultdict(set, {
+            old_key: targets for old_key, targets in redirects.items()
+            if old_key in previous_keys
+        })
+        key_redirects = _migrate_game_key_references(conn, reference_redirects)
         conn.execute("DELETE FROM canonical_members")
         current_game_ids: dict[str, int] = {}
+        uuid_redirects: dict[str, str] = {}
         for key, members in groups.items():
             display_name = display_by_key[key]
             tags = []
@@ -727,13 +851,34 @@ def rebuild_catalog(conn: sqlite3.Connection, *, manage_transaction: bool = True
                 (row["source"], row["event_type"])
                 for row in members
             }
+            prior_uuids = {
+                previous_uuid_by_source_row[row["id"]]
+                for row in members if row["id"] in previous_uuid_by_source_row
+            }
+            game_uuid = previous_uuid_by_key.get(key)
+            if not game_uuid and prior_uuids:
+                game_uuid = min(
+                    prior_uuids,
+                    key=lambda value: (previous_uuid_rank.get(value, 1 << 60), value),
+                )
+            game_uuid = game_uuid or str(uuid.uuid4())
+            # 纯改名时临时释放旧目录行上的 UUID，再让新目录行继承该 UUID。
+            # 旧数字 ID 仍按兼容逻辑重定向，而稳定 UUID 自始至终不变化。
+            if key not in previous_uuid_by_key and game_uuid in previous_uuid_rank:
+                conn.execute(
+                    "UPDATE canonical_games SET game_uuid=? WHERE game_uuid=?",
+                    (f"retired:{game_uuid}:{key}", game_uuid),
+                )
+            for prior_uuid in prior_uuids:
+                if prior_uuid != game_uuid:
+                    uuid_redirects[prior_uuid] = game_uuid
             conn.execute(
                 """
                 INSERT INTO canonical_games (
-                    canonical_key, name, normalized_name, developer, category,
+                    game_uuid, canonical_key, name, normalized_name, developer, category,
                     tags_json, gameplay_intro, icon_url, rating, first_seen_at,
                     last_seen_at, source_count, event_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(canonical_key) DO UPDATE SET
                     name=excluded.name,
                     normalized_name=excluded.normalized_name,
@@ -749,8 +894,8 @@ def rebuild_catalog(conn: sqlite3.Connection, *, manage_transaction: bool = True
                     event_count=excluded.event_count
                 """,
                 (
-                    key, display_name, key.removeprefix("name:") if key.startswith("name:")
-                    else normalize_game_name(display_name), developer, category,
+                    game_uuid, key, display_name, normalize_game_name(display_name),
+                    developer, category,
                     json.dumps(tags, ensure_ascii=False), intro, icon,
                     round(sum(ratings) / len(ratings), 1) if ratings else None,
                     min(row["first_seen_at"] for row in members),
@@ -759,12 +904,12 @@ def rebuild_catalog(conn: sqlite3.Connection, *, manage_transaction: bool = True
                 ),
             )
             game_id = conn.execute(
-                "SELECT id FROM canonical_games WHERE canonical_key=?", (key,)
-            ).fetchone()[0]
-            current_game_ids[key] = game_id
+                "SELECT id,game_uuid FROM canonical_games WHERE canonical_key=?", (key,)
+            ).fetchone()
+            current_game_ids[key] = game_id["id"]
             conn.executemany(
                 "INSERT INTO canonical_members(game_id, source_row_id) VALUES (?, ?)",
-                [(game_id, row["id"]) for row in members],
+                [(game_id["id"], row["id"]) for row in members],
             )
             conn.executemany(
                 "UPDATE source_items SET canonical_key=? WHERE id=?",
@@ -773,9 +918,12 @@ def rebuild_catalog(conn: sqlite3.Connection, *, manage_transaction: bool = True
         _record_game_id_redirects(
             conn, key_redirects, previous_game_ids, current_game_ids,
         )
+        _record_game_uuid_redirects(conn, uuid_redirects)
         conn.execute(
             "DELETE FROM canonical_games WHERE id NOT IN (SELECT DISTINCT game_id FROM canonical_members)"
         )
+        from .phase2_model import sync_phase2_model
+        sync_phase2_model(conn)
         if manage_transaction:
             conn.commit()
         return len(groups)
