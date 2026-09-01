@@ -339,7 +339,7 @@ class SimulatorSyncTest(unittest.TestCase):
                 (target_icons / "ui" / "oppo_gamecenter" / "media-failure.webp").exists()
             )
 
-    def test_existing_different_media_isolated_without_blocking_import(self):
+    def test_existing_different_media_is_replaced_by_latest_bundle(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source_db = root / "source.db"
@@ -371,8 +371,51 @@ class SimulatorSyncTest(unittest.TestCase):
                 cache_icons=False,
             )
             self.assertEqual(imported["items"], 1)
-            self.assertEqual(len(imported["media_conflicts"]), 1)
-            self.assertEqual(existing.read_bytes(), b"existing-media")
+            self.assertEqual(imported["publish_status"], "partial")
+            self.assertEqual(imported["media_conflicts"], [])
+            self.assertEqual(len(imported["media_replacements"]), 1)
+            self.assertEqual(existing.read_bytes(), b"new-media")
+
+    def test_media_replacement_is_restored_when_database_publish_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_db = root / "source.db"
+            observed = "2026-09-01T12:00:00+08:00"
+            conn = connect(source_db)
+            upsert_items(conn, [{
+                "source": "honor_gamecenter", "source_item_id": "media-rollback",
+                "name": "媒体覆盖回滚", "event_type": "launch",
+                "event_time": "2026-09-01",
+                "icon_url": "local-icon://ui/honor_gamecenter/media-rollback.webp",
+                "raw": {},
+            }], observed)
+            self._record_run(conn, "honor-ui", observed)
+            conn.commit()
+            conn.close()
+            icon = root / "icons" / "ui" / "honor_gamecenter" / "media-rollback.webp"
+            icon.parent.mkdir(parents=True)
+            icon.write_bytes(b"latest-media")
+            bundle = root / "media-rollback.tar.gz"
+            export_bundle(source_db, root / "raw", root / "icons", bundle, observed)
+
+            target_db = root / "target.db"
+            target_icons = root / "target-icons"
+            existing = target_icons / "ui" / "honor_gamecenter" / "media-rollback.webp"
+            existing.parent.mkdir(parents=True)
+            existing.write_bytes(b"previous-media")
+            with patch("newgame_monitor.simulator_sync.datetime") as clock:
+                clock.now.side_effect = RuntimeError("发布回执故障")
+                with self.assertRaisesRegex(RuntimeError, "发布回执故障"):
+                    import_bundle(
+                        bundle, target_db, root / "target-raw", target_icons,
+                        cache_icons=False,
+                    )
+
+            self.assertEqual(existing.read_bytes(), b"previous-media")
+            conn = connect(target_db)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM source_items").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM applied_bundles").fetchone()[0], 0)
+            conn.close()
 
     def test_import_rejects_parent_path(self):
         with tempfile.TemporaryDirectory() as temporary:

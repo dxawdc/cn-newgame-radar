@@ -381,30 +381,29 @@ def _media_plan(
     stage_root: Path,
     raw_dir: Path,
     icon_dir: Path,
-) -> tuple[list[tuple[Path, Path, Path]], list[dict[str, str]]]:
-    """构建媒体发布计划，并隔离已有但内容不同的文件。
-
-    正式目录中的旧媒体不能被静默覆盖；但单个媒体冲突也不应阻断同一
-    bundle 的数据库和其他媒体发布。冲突文件保留线上版本，并在结果中
-    返回 expected/actual 哈希供后续复核。
-    """
+) -> tuple[list[tuple[Path, Path, Path, bool]], list[dict[str, str]]]:
+    """构建媒体发布计划，已有同路径文件由最新入库 bundle 覆盖。"""
     plan = []
-    conflicts = []
+    replacements = []
     for record in manifest.get("files", []):
         relative = _safe_member_path(record["path"])
         root = raw_dir.resolve() if relative.parts[0] == "raw" else icon_dir.resolve()
         target = root.joinpath(*relative.parts[1:])
         if not _is_within(target, root):
             raise ValueError(f'增量包目标路径越界：{record["path"]}')
-        if target.exists() and (not target.is_file() or _sha256_file(target) != record["sha256"]):
-            conflicts.append({
-                "path": record["path"],
-                "expected_sha256": record["sha256"],
-                "actual_sha256": _sha256_file(target) if target.is_file() else "<not-file>",
-            })
+        replace_existing = target.exists()
+        if replace_existing and not target.is_file():
+            raise ValueError(f'增量包媒体目标不是文件：{record["path"]}')
+        if replace_existing and _sha256_file(target) == record["sha256"]:
             continue
-        plan.append((stage_root.joinpath(*relative.parts), target, root))
-    return plan, conflicts
+        if replace_existing:
+            replacements.append({
+                "path": record["path"],
+                "previous_sha256": _sha256_file(target),
+                "latest_sha256": record["sha256"],
+            })
+        plan.append((stage_root.joinpath(*relative.parts), target, root, replace_existing))
+    return plan, replacements
 
 
 def _remove_created(paths: list[tuple[Path, Path]]) -> None:
@@ -417,6 +416,17 @@ def _remove_created(paths: list[tuple[Path, Path]]) -> None:
                 parent = parent.parent
         except OSError:
             pass
+
+
+def _restore_replaced(paths: list[tuple[Path, Path]]) -> None:
+    """发布事务失败时恢复被覆盖的旧媒体。"""
+    for target, backup in reversed(paths):
+        restore = target.with_name(f".{target.name}.{uuid.uuid4().hex}.restore")
+        try:
+            shutil.copy2(backup, restore)
+            os.replace(restore, target)
+        finally:
+            restore.unlink(missing_ok=True)
 
 
 def import_bundle(
@@ -441,7 +451,7 @@ def import_bundle(
                 raise ValueError(f"删除标记包含未授权渠道：{row.get('source')}")
             if any(field not in row for field in BUSINESS_KEY):
                 raise ValueError("删除标记缺少业务主键")
-        media_plan, media_conflicts = _media_plan(manifest, stage_root, raw_dir, icon_dir)
+        media_plan, media_replacements = _media_plan(manifest, stage_root, raw_dir, icon_dir)
 
         conn = connect(db_path)
         existing = conn.execute(
@@ -470,6 +480,7 @@ def import_bundle(
             grouped[observed_at].append(item)
 
         created_media: list[tuple[Path, Path]] = []
+        replaced_media: list[tuple[Path, Path]] = []
         try:
             begin_immediate_with_retry(conn)
             imported = 0
@@ -546,22 +557,34 @@ def import_bundle(
 
             games = rebuild_catalog(conn, manage_transaction=False)
             completeness = audit_catalog_completeness(conn)
-            for staged, target, root in media_plan:
-                if target.exists():
-                    continue
+            media_backup_root = stage_root / ".media-backup"
+            for index, (staged, target, root, replace_existing) in enumerate(media_plan):
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with staged.open("rb") as source, target.open("xb") as destination:
+                temporary_target = target.with_name(
+                    f".{target.name}.{manifest['bundle_id']}.{index}.tmp"
+                )
+                backup = media_backup_root / f"{index}.bak"
+                if replace_existing:
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(target, backup)
+                    replaced_media.append((target, backup))
+                else:
                     created_media.append((target, root))
-                    shutil.copyfileobj(source, destination)
-                    destination.flush()
-                    os.fsync(destination.fileno())
+                try:
+                    with staged.open("rb") as source, temporary_target.open("xb") as destination:
+                        shutil.copyfileobj(source, destination)
+                        destination.flush()
+                        os.fsync(destination.fileno())
+                    os.replace(temporary_target, target)
+                finally:
+                    temporary_target.unlink(missing_ok=True)
 
             result = {
                 "bundle_id": manifest["bundle_id"],
                 "duplicate": False,
                 "publish_status": (
                     "partial"
-                    if manifest.get("failed_run_sources") or media_conflicts
+                    if manifest.get("failed_run_sources")
                     else "published"
                 ),
                 "published_sources": manifest.get("run_sources", []),
@@ -571,7 +594,8 @@ def import_bundle(
                 "runs": imported_runs,
                 "raw_files": sum(record["path"].startswith("raw/") for record in manifest.get("files", [])),
                 "icon_files": sum(record["path"].startswith("icons/") for record in manifest.get("files", [])),
-                "media_conflicts": media_conflicts,
+                "media_conflicts": [],
+                "media_replacements": media_replacements,
                 "games": games,
                 "completeness": completeness,
                 "cursor": manifest.get("cursor", {}),
@@ -580,7 +604,7 @@ def import_bundle(
             if pipeline_run:
                 published_status = (
                     "partial"
-                    if manifest.get("failed_run_sources") or media_conflicts
+                    if manifest.get("failed_run_sources")
                     else "published"
                 )
                 for stage_name in ("imported", "published"):
@@ -624,6 +648,7 @@ def import_bundle(
             conn.commit()
         except Exception:
             conn.rollback()
+            _restore_replaced(replaced_media)
             _remove_created(created_media)
             conn.close()
             raise
