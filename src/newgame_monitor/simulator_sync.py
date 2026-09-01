@@ -369,8 +369,20 @@ def _validate_and_stage_bundle(bundle_path: Path, stage_root: Path) -> tuple[dic
     return manifest, manifest_bytes
 
 
-def _media_plan(manifest: dict, stage_root: Path, raw_dir: Path, icon_dir: Path) -> list[tuple[Path, Path, Path]]:
+def _media_plan(
+    manifest: dict,
+    stage_root: Path,
+    raw_dir: Path,
+    icon_dir: Path,
+) -> tuple[list[tuple[Path, Path, Path]], list[dict[str, str]]]:
+    """构建媒体发布计划，并隔离已有但内容不同的文件。
+
+    正式目录中的旧媒体不能被静默覆盖；但单个媒体冲突也不应阻断同一
+    bundle 的数据库和其他媒体发布。冲突文件保留线上版本，并在结果中
+    返回 expected/actual 哈希供后续复核。
+    """
     plan = []
+    conflicts = []
     for record in manifest.get("files", []):
         relative = _safe_member_path(record["path"])
         root = raw_dir.resolve() if relative.parts[0] == "raw" else icon_dir.resolve()
@@ -378,9 +390,14 @@ def _media_plan(manifest: dict, stage_root: Path, raw_dir: Path, icon_dir: Path)
         if not _is_within(target, root):
             raise ValueError(f'增量包目标路径越界：{record["path"]}')
         if target.exists() and (not target.is_file() or _sha256_file(target) != record["sha256"]):
-            raise ValueError(f'正式媒体目标已存在且内容不同：{record["path"]}')
+            conflicts.append({
+                "path": record["path"],
+                "expected_sha256": record["sha256"],
+                "actual_sha256": _sha256_file(target) if target.is_file() else "<not-file>",
+            })
+            continue
         plan.append((stage_root.joinpath(*relative.parts), target, root))
-    return plan
+    return plan, conflicts
 
 
 def _remove_created(paths: list[tuple[Path, Path]]) -> None:
@@ -417,7 +434,7 @@ def import_bundle(
                 raise ValueError(f"删除标记包含未授权渠道：{row.get('source')}")
             if any(field not in row for field in BUSINESS_KEY):
                 raise ValueError("删除标记缺少业务主键")
-        media_plan = _media_plan(manifest, stage_root, raw_dir, icon_dir)
+        media_plan, media_conflicts = _media_plan(manifest, stage_root, raw_dir, icon_dir)
 
         conn = connect(db_path)
         existing = conn.execute(
@@ -535,7 +552,11 @@ def import_bundle(
             result = {
                 "bundle_id": manifest["bundle_id"],
                 "duplicate": False,
-                "publish_status": "partial" if manifest.get("failed_run_sources") else "published",
+                "publish_status": (
+                    "partial"
+                    if manifest.get("failed_run_sources") or media_conflicts
+                    else "published"
+                ),
                 "published_sources": manifest.get("run_sources", []),
                 "failed_sources": manifest.get("failed_run_sources", []),
                 "items": imported,
@@ -543,13 +564,18 @@ def import_bundle(
                 "runs": imported_runs,
                 "raw_files": sum(record["path"].startswith("raw/") for record in manifest.get("files", [])),
                 "icon_files": sum(record["path"].startswith("icons/") for record in manifest.get("files", [])),
+                "media_conflicts": media_conflicts,
                 "games": games,
                 "completeness": completeness,
                 "cursor": manifest.get("cursor", {}),
             }
             applied_at = datetime.now().astimezone().isoformat()
             if pipeline_run:
-                published_status = "partial" if manifest.get("failed_run_sources") else "published"
+                published_status = (
+                    "partial"
+                    if manifest.get("failed_run_sources") or media_conflicts
+                    else "published"
+                )
                 for stage_name in ("imported", "published"):
                     conn.execute(
                         """

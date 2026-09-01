@@ -302,6 +302,41 @@ class SimulatorSyncTest(unittest.TestCase):
                 (target_icons / "ui" / "oppo_gamecenter" / "media-failure.webp").exists()
             )
 
+    def test_existing_different_media_isolated_without_blocking_import(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_db = root / "source.db"
+            observed = "2026-08-28T07:00:00+08:00"
+            conn = connect(source_db)
+            upsert_items(conn, [{
+                "source": "honor_gamecenter", "source_item_id": "media-conflict",
+                "name": "媒体冲突产品", "event_type": "launch",
+                "event_time": "2026-08-28",
+                "icon_url": "local-icon://ui/honor_gamecenter/media-conflict.webp",
+                "raw": {},
+            }], observed)
+            self._record_run(conn, "honor-ui", observed)
+            conn.commit()
+            conn.close()
+            icon = root / "icons" / "ui" / "honor_gamecenter" / "media-conflict.webp"
+            icon.parent.mkdir(parents=True)
+            icon.write_bytes(b"new-media")
+            bundle = root / "media-conflict.tar.gz"
+            export_bundle(source_db, root / "raw", root / "icons", bundle, observed)
+
+            target_db = root / "target.db"
+            target_icons = root / "target-icons"
+            existing = target_icons / "ui" / "honor_gamecenter" / "media-conflict.webp"
+            existing.parent.mkdir(parents=True)
+            existing.write_bytes(b"existing-media")
+            imported = import_bundle(
+                bundle, target_db, root / "target-raw", target_icons,
+                cache_icons=False,
+            )
+            self.assertEqual(imported["items"], 1)
+            self.assertEqual(len(imported["media_conflicts"]), 1)
+            self.assertEqual(existing.read_bytes(), b"existing-media")
+
     def test_import_rejects_parent_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
