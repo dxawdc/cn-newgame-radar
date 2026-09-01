@@ -967,6 +967,33 @@ def _wait_for_text_node(
     return None, latest
 
 
+def _dismiss_honor_home_overlays(xml: bytes, attempts: int = 3) -> bytes:
+    """关闭荣耀首页推荐弹窗，避免遮挡“新游”等主导航入口。"""
+    latest = xml
+    for attempt in range(attempts):
+        root = ET.fromstring(latest)
+        dialog = next(
+            (
+                node for node in root.iter("node")
+                if node.get("resource-id", "").endswith("/dialog_card_view")
+            ),
+            None,
+        )
+        close = next(
+            (
+                node for node in root.iter("node")
+                if node.get("resource-id", "").endswith("/close_view")
+            ),
+            None,
+        )
+        if dialog is None or close is None:
+            break
+        _tap_node(close)
+        time.sleep(1.5)
+        latest = _dump_ui(f"honor-home-overlay-{attempt + 1}")
+    return latest
+
+
 def _start_app(package: str, component: str, wait_seconds: float = 6) -> bytes:
     _adb("shell", "am", "force-stop", package)
     _adb("shell", "am", "start", "-n", component)
@@ -1106,6 +1133,7 @@ def collect_honor_ui() -> tuple[list[dict], list[tuple[str, bytes]], dict]:
         "com.hihonor.gamecenter",
         "com.hihonor.gamecenter/.bu_games_display.splash.SplashActivity",
     )
+    start_xml = _dismiss_honor_home_overlays(start_xml)
     new_tab, start_xml = _wait_for_text_node(
         start_xml, "新游", dump_prefix="honor-home-ready", max_top=500,
     )

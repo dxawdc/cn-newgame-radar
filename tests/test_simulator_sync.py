@@ -172,6 +172,43 @@ class SimulatorSyncTest(unittest.TestCase):
             )
             conn.close()
 
+    def test_optional_9game_run_is_synced_when_collected_locally(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_db = root / "source.db"
+            observed = "2026-09-01T07:15:00+08:00"
+            conn = connect(source_db)
+            upsert_items(conn, [{
+                "source": "uc_9game", "source_item_id": "9game-local",
+                "name": "九游本机采集产品", "event_type": "launch",
+                "event_time": "2026-09-01", "raw": {},
+            }], observed)
+            self._record_run(conn, "9game", observed)
+            conn.commit()
+            conn.close()
+
+            bundle = root / "9game.tar.gz"
+            exported = export_bundle(
+                source_db, root / "raw", root / "icons", bundle, observed,
+            )
+            self.assertIn("9game", exported["published_sources"])
+            self.assertEqual(exported["items"], 1)
+
+            target_db = root / "target.db"
+            imported = import_bundle(
+                bundle, target_db, root / "target-raw", root / "target-icons",
+                cache_icons=False,
+            )
+            self.assertIn("9game", imported["published_sources"])
+            conn = connect(target_db)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM source_items WHERE source='uc_9game'"
+                ).fetchone()[0],
+                1,
+            )
+            conn.close()
+
     def test_snapshot_diff_syncs_historical_update_delete_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

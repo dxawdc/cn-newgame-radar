@@ -13,7 +13,7 @@ Environment=TZ=Asia/Shanghai
 Environment=NEWGAME_DB=/var/lib/newgame-monitor/data/newgame_monitor.db
 Environment=NEWGAME_ICON_DIR=/var/lib/newgame-monitor/data/icons
 Environment=NEWGAME_SCREENSHOT_DIR=/var/lib/newgame-monitor/data/screenshots
-ExecStart=/usr/bin/flock -n /run/lock/newgame-monitor-collector.lock /opt/newgame-monitor/venv/bin/python -m newgame_monitor.cli --sources taptap ios-cn xiaomi vivo 4399 233 3839 9game --db /var/lib/newgame-monitor/data/newgame_monitor.db --raw-dir /var/lib/newgame-monitor/raw --icon-dir /var/lib/newgame-monitor/data/icons --screenshot-dir /var/lib/newgame-monitor/data/screenshots
+ExecStart=/usr/bin/flock -n /run/lock/newgame-monitor-collector.lock /opt/newgame-monitor/venv/bin/python -m newgame_monitor.cli --sources ios-cn xiaomi vivo 4399 233 3839 --db /var/lib/newgame-monitor/data/newgame_monitor.db --raw-dir /var/lib/newgame-monitor/raw --icon-dir /var/lib/newgame-monitor/data/icons --screenshot-dir /var/lib/newgame-monitor/data/screenshots
 TimeoutStartSec=3h
 Nice=10
 

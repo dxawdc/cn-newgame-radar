@@ -13,7 +13,7 @@ if (-not $env:NEWGAME_ADB_SERIAL) {
 
 Set-Location $projectRoot
 python -m newgame_monitor.cli `
-    --sources taptap huawei-cache honor-ui oppo-ui `
+    --sources taptap 9game huawei-cache honor-ui oppo-ui `
     --db data/newgame_monitor.db `
     --raw-dir raw `
     --icon-dir data/icons `

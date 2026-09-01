@@ -31,6 +31,7 @@ from newgame_monitor.app_cache_collectors import (
     _attach_oppo_offline_metadata,
     _clean_ui_text,
     _capture_oppo_gallery,
+    _dismiss_honor_home_overlays,
     _dump_ui,
     _enrich_visible_oppo_details,
     _huawei_event_fields,
@@ -374,6 +375,32 @@ class HaoYouDetailTest(unittest.TestCase):
         self.assertIsNotNone(node)
         self.assertEqual(latest, ready)
         dump_ui.assert_called_once_with("honor-home-ready-1")
+
+    def test_honor_home_dismisses_recommendation_overlay(self):
+        overlay = b"""
+        <hierarchy>
+          <node resource-id="com.hihonor.gamecenter:id/dialog_card_view">
+            <node resource-id="com.hihonor.gamecenter:id/recommend_image" />
+          </node>
+          <node resource-id="com.hihonor.gamecenter:id/close_view"
+                bounds="[648,2208][792,2352]" />
+        </hierarchy>
+        """
+        ready = (
+            b'<hierarchy><node package="com.hihonor.gamecenter" text="\xe6\x96\xb0\xe6\xb8\xb8" '
+            b'bounds="[150,240][278,392]" /></hierarchy>'
+        )
+
+        with patch(
+            "newgame_monitor.app_cache_collectors._tap_node",
+        ) as tap, patch(
+            "newgame_monitor.app_cache_collectors._dump_ui", return_value=ready,
+        ) as dump_ui, patch("newgame_monitor.app_cache_collectors.time.sleep"):
+            latest = _dismiss_honor_home_overlays(overlay)
+
+        self.assertEqual(latest, ready)
+        tap.assert_called_once()
+        dump_ui.assert_called_once_with("honor-home-overlay-1")
 
     def test_huawei_game_event_uses_recruitment_type_and_start_time(self):
         event_type, event_time, status = _huawei_event_fields({

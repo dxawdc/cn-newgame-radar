@@ -25,12 +25,15 @@ from .icon_cache import cache_remote_icons
 SCHEMA_VERSION = 2
 RUN_TO_ITEM = {
     "taptap": "taptap",
+    "9game": "uc_9game",
     "huawei-cache": "huawei_gamecenter",
     "honor-ui": "honor_gamecenter",
     "oppo-ui": "oppo_gamecenter",
 }
 ITEM_SOURCES = set(RUN_TO_ITEM.values())
 RUN_SOURCES = set(RUN_TO_ITEM)
+REQUIRED_RUN_SOURCES = {"taptap", "huawei-cache", "honor-ui", "oppo-ui"}
+OPTIONAL_RUN_SOURCES = RUN_SOURCES - REQUIRED_RUN_SOURCES
 PUBLISHABLE_RUN_STATUSES = {"success", "degraded"}
 MAX_MEMBERS = 5000
 MAX_TOTAL_BYTES = 512 * 1024 * 1024
@@ -246,7 +249,11 @@ def export_bundle(
         for name, path in sorted(files.items())
     ]
     bundle_id = str(uuid.uuid4())
-    failed_runs = sorted(RUN_SOURCES - publishable_runs)
+    failed_present = {
+        source for source, run in latest_by_source.items()
+        if source in RUN_SOURCES and run["status"] not in PUBLISHABLE_RUN_STATUSES
+    }
+    failed_runs = sorted((REQUIRED_RUN_SOURCES - publishable_runs) | failed_present)
     pipeline = _pipeline_payload(db_path, since)
     if pipeline:
         pipeline["run"]["bundle_id"] = bundle_id
