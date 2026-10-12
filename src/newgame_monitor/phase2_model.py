@@ -367,7 +367,12 @@ def sync_phase2_model(conn: sqlite3.Connection) -> dict:
     """从当前目录无损生成第二阶段并行模型；可重复执行。"""
     now = datetime.now().astimezone().isoformat()
     conn.execute("UPDATE platform_listings SET status='stale'")
-    rows = list(conn.execute(
+    from .gallery import extract_gallery_urls
+    rows: list[dict] = []
+    gallery_by_listing: dict[int, dict[str, None]] = defaultdict(dict)
+    listing_by_source_row: dict[int, tuple[int, str]] = {}
+    # 原始响应逐行生成快照；后续身份复核只保留轻量字段和图集 URL。
+    for row in conn.execute(
         """
         SELECT si.*,cg.game_uuid
         FROM source_items si
@@ -375,12 +380,17 @@ def sync_phase2_model(conn: sqlite3.Connection) -> dict:
         JOIN canonical_games cg ON cg.id=cm.game_id
         ORDER BY si.id
         """
-    ))
-    listing_by_source_row: dict[int, tuple[int, str]] = {}
-    for row in rows:
+    ):
         listing_id, game_uuid = _sync_listing_row(conn, row, now)
         listing_by_source_row[row["id"]] = (listing_id, game_uuid)
         _sync_event(conn, row, listing_id, game_uuid)
+        gallery_by_listing[listing_id].update(dict.fromkeys(
+            extract_gallery_urls(row["source"], row["raw_json"])
+        ))
+        rows.append({key: row[key] for key in (
+            "id", "game_uuid", "source", "source_item_id", "package_name",
+            "developer", "full_description", "gameplay_intro", "last_seen_at",
+        )})
 
     # 名称只召回候选，不直接合并。候选是否可自动处理由结构化佐证分数决定。
     from .catalog import identity_candidate_names
@@ -424,7 +434,7 @@ def sync_phase2_model(conn: sqlite3.Connection) -> dict:
 
     # 已有旧目录可能曾仅凭同名合并。检测产品内部相互矛盾的包名和开发主体，
     # 不自动拆分带收藏的历史身份，而是生成高优先级拆分复核任务。
-    rows_by_game: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    rows_by_game: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
         rows_by_game[row["game_uuid"]].append(row)
     for game_uuid, members in rows_by_game.items():
@@ -455,8 +465,7 @@ def sync_phase2_model(conn: sqlite3.Connection) -> dict:
             now=now,
         )
 
-    from .gallery import extract_gallery_urls
-    listing_rows: dict[int, list[sqlite3.Row]] = defaultdict(list)
+    listing_rows: dict[int, list[dict]] = defaultdict(list)
     for row in rows:
         listing_rows[listing_by_source_row[row["id"]][0]].append(row)
     for listing_id, members in listing_rows.items():
@@ -465,9 +474,7 @@ def sync_phase2_model(conn: sqlite3.Connection) -> dict:
             len((row["full_description"] or row["gameplay_intro"] or "").strip()) >= 30
             for row in members
         )
-        gallery_urls = list(dict.fromkeys(
-            url for row in members for url in extract_gallery_urls(row["source"], row["raw_json"])
-        ))
+        gallery_urls = list(gallery_by_listing[listing_id])
         for queue_type, missing, priority in (
             ("detail", not has_detail, 70), ("gallery", not gallery_urls, 60),
         ):

@@ -1,0 +1,14 @@
+[Unit]
+Description=每日错峰补齐新游媒体
+
+[Timer]
+# 详情同步通常在 10:30 后完成；多时段运行，避免新详情要等到次日才缓存媒体。
+OnCalendar=*-*-* 08:30:00 Asia/Shanghai
+OnCalendar=*-*-* 12:00:00 Asia/Shanghai
+OnCalendar=*-*-* 18:00:00 Asia/Shanghai
+OnCalendar=*-*-* 00:00:00 Asia/Shanghai
+Persistent=false
+Unit=newgame-monitor-media.service
+
+[Install]
+WantedBy=timers.target

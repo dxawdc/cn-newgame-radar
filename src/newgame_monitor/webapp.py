@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 from urllib.parse import quote, urlsplit
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
@@ -306,7 +307,16 @@ def _period_range(period: str, anchor: str | None) -> tuple[date | None, date | 
     raise ValueError("period 仅支持 day/week/month/all")
 
 
+_CATALOG_LOAD_LOCK = threading.Lock()
+
+
 def _load_catalog(conn: sqlite3.Connection) -> list[dict]:
+    # 避免并发请求各自同时加载全库原始详情，挤占后台入库的内存。
+    with _CATALOG_LOAD_LOCK:
+        return _load_catalog_compact(conn)
+
+
+def _load_catalog_compact(conn: sqlite3.Connection) -> list[dict]:
     if conn.execute("SELECT COUNT(*) FROM canonical_games").fetchone()[0] == 0:
         rebuild_catalog(conn)
     games = {row["id"]: {**dict(row), "members": []} for row in conn.execute("SELECT * FROM canonical_games")}
@@ -315,12 +325,16 @@ def _load_catalog(conn: sqlite3.Connection) -> list[dict]:
         SELECT cm.game_id, si.*
         FROM canonical_members cm
         JOIN source_items si ON si.id=cm.source_row_id
-        ORDER BY si.event_time, si.first_seen_at
         """
     )
     for row in rows:
         if row["game_id"] in games:
-            games[row["game_id"]]["members"].append(row)
+            member = dict(row)
+            member["_gallery_urls"] = extract_gallery_urls(member["source"], member.pop("raw_json"))
+            games[row["game_id"]]["members"].append(member)
+    # 原始 JSON 常为几十 KB/行；流式提取图集后立即释放，排序仅保留展示字段。
+    for game in games.values():
+        game["members"].sort(key=lambda row: (row["event_time"] or "", row["first_seen_at"] or ""))
     assets = {
         row["source_url"]: row["relative_path"]
         for row in conn.execute("SELECT source_url, relative_path FROM icon_assets WHERE status='success'")
@@ -347,6 +361,58 @@ def _load_catalog(conn: sqlite3.Connection) -> list[dict]:
     return list(games.values())
 
 
+def _load_game(
+    conn: sqlite3.Connection, *, game_id: int | None = None, game_uuid: str | None = None,
+) -> dict | None:
+    """只读取当前产品及关联媒体，避免详情请求进入全库目录加载锁。"""
+    if game_id is not None:
+        row = conn.execute("SELECT * FROM canonical_games WHERE id=?", (game_id,)).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM canonical_games WHERE game_uuid=?", (game_uuid,)).fetchone()
+    if row is None:
+        return None
+    game = {**dict(row), "members": []}
+    for row in conn.execute(
+        """SELECT cm.game_id,si.* FROM canonical_members cm
+           JOIN source_items si ON si.id=cm.source_row_id WHERE cm.game_id=?""",
+        (game["id"],),
+    ):
+        member = dict(row)
+        member["_gallery_urls"] = extract_gallery_urls(member["source"], member.pop("raw_json"))
+        game["members"].append(member)
+    game["members"].sort(key=lambda row: (row["event_time"] or "", row["first_seen_at"] or ""))
+
+    candidates = [game.get("icon_url"), *[row["icon_url"] for row in game["members"]]]
+    for candidate in dict.fromkeys(value for value in candidates if value):
+        if candidate.startswith("local-icon://"):
+            relative = candidate.removeprefix("local-icon://")
+        else:
+            asset = conn.execute(
+                "SELECT relative_path FROM icon_assets WHERE source_url=? AND status='success'",
+                (candidate,),
+            ).fetchone()
+            relative = asset["relative_path"] if asset else None
+        if relative and (ICON_DIR / relative).exists():
+            game["_local_icon_url"] = f"{BASE_PATH}/icons/{relative}"
+            break
+
+    urls = list(dict.fromkeys(url for row in game["members"] for url in row["_gallery_urls"]))
+    assets = {}
+    # 分批查询，避免历史记录多时触及 SQLite 参数数量限制。
+    for start in range(0, len(urls), 400):
+        batch = urls[start:start + 400]
+        placeholders = ",".join("?" for _ in batch)
+        for asset in conn.execute(
+            f"SELECT source_url,relative_path FROM screenshot_assets WHERE status='success' AND source_url IN ({placeholders})",
+            batch,
+        ):
+            relative = asset["relative_path"]
+            if relative and (SCREENSHOT_DIR / relative).exists():
+                assets[asset["source_url"]] = relative
+    game["_screenshot_assets"] = assets
+    return game
+
+
 def _resolve_game_id(
     conn: sqlite3.Connection,
     requested_id: int,
@@ -354,17 +420,16 @@ def _resolve_game_id(
     existing_ids: set[int] | None = None,
 ) -> int | None:
     """把已删除的旧产品 ID 安全解析到当前产品，遇到断链、环或超长链则失败。"""
-    if existing_ids is None:
-        existing_ids = {
-            row["id"] for row in conn.execute("SELECT id FROM canonical_games")
-        }
     current_id = requested_id
     seen: set[int] = set()
     for hop in range(GAME_ID_REDIRECT_MAX_HOPS + 1):
         if current_id in seen:
             return None
         seen.add(current_id)
-        if current_id in existing_ids:
+        exists = current_id in existing_ids if existing_ids is not None else conn.execute(
+            "SELECT 1 FROM canonical_games WHERE id=?", (current_id,),
+        ).fetchone() is not None
+        if exists:
             return current_id
         if hop == GAME_ID_REDIRECT_MAX_HOPS:
             return None
@@ -383,6 +448,8 @@ def _resolve_game_id(
 
 def _game_gallery(game: dict) -> list[dict]:
     def media_count(row) -> int:
+        if "_gallery_urls" in row.keys():
+            return len(row["_gallery_urls"])
         try:
             raw_json = row["raw_json"]
         except (KeyError, IndexError):
@@ -643,17 +710,21 @@ def _filtered_games(
     sources: set[str] | None = None, categories: set[str] | None = None,
     developers: set[str] | None = None, event_types: set[str] | None = None,
     q: str | None = None, view_mode: str = "product",
+    catalog: list[dict] | None = None,
 ) -> list[dict]:
     start, end = _period_range(period, anchor)
     if date_from:
         start = date.fromisoformat(date_from)
     if date_to:
         end = date.fromisoformat(date_to)
-    conn = _read_conn()
-    try:
-        games = _load_catalog(conn)
-    finally:
-        conn.close()
+    if catalog is None:
+        conn = _read_conn()
+        try:
+            games = _load_catalog(conn)
+        finally:
+            conn.close()
+    else:
+        games = catalog
     result = []
     needle = (q or "").casefold().strip()
     for game in games:
@@ -1434,10 +1505,10 @@ def game_detail(game_id: int, request: Request):
     favorite_dates = _favorite_dates(context["user"]["id"]) if context else {}
     conn = _read_conn()
     try:
-        catalog = _load_catalog(conn)
-        games_by_id = {item["id"]: item for item in catalog}
-        resolved_id = _resolve_game_id(conn, game_id, existing_ids=set(games_by_id))
-        game = games_by_id.get(resolved_id) if resolved_id is not None else None
+        # 身份解析、成员和媒体读取使用同一快照，避免与目录重建交错。
+        conn.execute("BEGIN")
+        resolved_id = _resolve_game_id(conn, game_id)
+        game = _load_game(conn, game_id=resolved_id) if resolved_id is not None else None
         if not game:
             return {"error": "not_found"}
         payload = _serialize(game)
@@ -1456,13 +1527,11 @@ def game_detail_by_uuid(game_uuid: str, request: Request):
     favorite_dates = _favorite_dates(context["user"]["id"]) if context else {}
     conn = _read_conn()
     try:
+        conn.execute("BEGIN")
         current_uuid = resolve_game_uuid(conn, game_uuid)
         if not current_uuid:
             return {"error": "not_found"}
-        game = next(
-            (item for item in _load_catalog(conn) if item["game_uuid"] == current_uuid),
-            None,
-        )
+        game = _load_game(conn, game_uuid=current_uuid)
         if not game:
             return {"error": "not_found"}
         payload = _serialize(game)
@@ -1482,14 +1551,19 @@ def summary(
     if view not in {"product", "channel"}:
         raise HTTPException(status_code=422, detail="view 仅支持 product/channel")
     current = anchor or date.today().isoformat()
+    conn = _read_conn()
+    try:
+        catalog = _load_catalog(conn)
+    finally:
+        conn.close()
     periods = {
         period: _filtered_games(
-            period, current, event_types=_event_scope(event_type), view_mode=view,
+            period, current, event_types=_event_scope(event_type), view_mode=view, catalog=catalog,
         )
         for period in ("day", "week", "month", "all")
     }
     event_count = len(_filtered_games(
-        "all", event_types=set(EVENT_LABELS), view_mode="channel",
+        "all", event_types=set(EVENT_LABELS), view_mode="channel", catalog=catalog,
     ))
     conn = _read_conn()
     try:

@@ -15,6 +15,24 @@ from newgame_monitor.enrichment import _find_taptap_detail_content
 
 
 class WebAppTest(unittest.TestCase):
+    def test_catalog_discards_large_raw_but_preserves_gallery_and_intro(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            conn = connect(root / 'db.sqlite')
+            upsert_items(conn, [{
+                'source': 'taptap', 'source_item_id': 'compact-1', 'name': '压缩展示测试',
+                'event_type': 'launch', 'event_time': '2026-09-16',
+                'full_description': '完整游戏介绍需要保留',
+                'raw': {'unused': 'x' * 50000, 'detail_screenshots': [{'url': 'https://tapimg.com/a.jpg'}]},
+            }], '2026-09-16T07:00:00+08:00')
+            rebuild_catalog(conn)
+            with patch.object(webapp, 'ICON_DIR', root / 'icons'), patch.object(webapp, 'SCREENSHOT_DIR', root / 'screenshots'):
+                game = webapp._load_catalog(conn)[0]
+                self.assertNotIn('raw_json', game['members'][0])
+                self.assertEqual(webapp._game_gallery(game)[0]['url'], 'https://tapimg.com/a.jpg')
+                self.assertEqual(webapp._latest_game_intro(game)['text'], '完整游戏介绍需要保留')
+            conn.close()
+
     def test_unknown_event_type_is_exposed_for_quarantine_review(self):
         member = {
             "source": "taptap", "event_type": "mystery_event",

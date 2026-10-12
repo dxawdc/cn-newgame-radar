@@ -1,0 +1,26 @@
+[Unit]
+Description=新游增量入库 %i
+After=network.target
+OnSuccess=newgame-monitor-media.service
+
+[Service]
+Type=oneshot
+User=newgame-monitor
+Group=newgame-monitor
+WorkingDirectory=/opt/newgame-monitor/current
+Environment=PYTHONPATH=/opt/newgame-monitor/current/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/flock -w 60 /run/lock/newgame-monitor-collector.lock /opt/newgame-monitor/venv/bin/python -m newgame_monitor.import_job run --run-id %i
+TimeoutStartSec=15min
+TimeoutStopSec=15s
+KillMode=control-group
+MemoryAccounting=true
+MemoryHigh=384M
+MemoryMax=512M
+MemorySwapMax=0
+CPUQuota=80%
+IOWeight=10
+Nice=10
+TasksMax=32
+OOMPolicy=stop
+NoNewPrivileges=true

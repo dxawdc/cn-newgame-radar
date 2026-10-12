@@ -34,6 +34,7 @@ from newgame_monitor.app_cache_collectors import (
     _dismiss_honor_home_overlays,
     _dump_ui,
     _enrich_visible_oppo_details,
+    _honor_new_tab_node,
     _huawei_event_fields,
     _oppo_network_response_data,
     _oppo_offline_blobs,
@@ -401,6 +402,39 @@ class HaoYouDetailTest(unittest.TestCase):
         self.assertEqual(latest, ready)
         tap.assert_called_once()
         dump_ui.assert_called_once_with("honor-home-overlay-1")
+
+    def test_honor_home_dismisses_version_update_dialog(self):
+        update = """
+        <hierarchy>
+          <node resource-id="com.hihonor.gamecenter:id/hwdialogpattern_content"
+                text="应用 游戏中心&#13;&#10;版本 16.0.46.302" />
+          <node resource-id="com.hihonor.gamecenter:id/button1"
+                text="以后再说" bounds="[116,2304][696,2480]" />
+        </hierarchy>
+        """.encode("utf-8")
+        ready = (
+            b'<hierarchy><node package="com.hihonor.gamecenter" '
+            b'resource-id="com.hihonor.gamecenter:id/tv_sub_indicator" '
+            b'bounds="[156,240][284,392]" /></hierarchy>'
+        )
+
+        with patch("newgame_monitor.app_cache_collectors._tap_node") as tap, patch(
+            "newgame_monitor.app_cache_collectors._dump_ui", return_value=ready,
+        ) as dump_ui, patch("newgame_monitor.app_cache_collectors.time.sleep"):
+            latest = _dismiss_honor_home_overlays(update)
+
+        self.assertEqual(latest, ready)
+        tap.assert_called_once()
+        dump_ui.assert_called_once_with("honor-home-overlay-1")
+
+    def test_honor_new_tab_falls_back_to_stable_resource_id(self):
+        root = ET.fromstring(
+            b'<hierarchy><node resource-id="com.hihonor.gamecenter:id/tv_sub_indicator" '
+            b'bounds="[156,240][284,392]" /></hierarchy>'
+        )
+        node = _honor_new_tab_node(root)
+        self.assertIsNotNone(node)
+        self.assertEqual(node.get("resource-id"), "com.hihonor.gamecenter:id/tv_sub_indicator")
 
     def test_huawei_game_event_uses_recruitment_type_and_start_time(self):
         event_type, event_time, status = _huawei_event_fields({

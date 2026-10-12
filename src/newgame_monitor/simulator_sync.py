@@ -15,6 +15,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+from typing import Callable
 
 from .catalog import audit_catalog_completeness, rebuild_catalog
 from .db import begin_immediate_with_retry, connect, upsert_items
@@ -435,13 +436,17 @@ def import_bundle(
     raw_dir: Path,
     icon_dir: Path,
     screenshot_dir: Path | None = None,
-    cache_icons: bool = True,
+    cache_icons: bool = False,
+    progress: Callable[[str], None] | None = None,
 ) -> dict:
     """先全量校验并 staging，再将数据、运行记录、目录和回执单事务发布。"""
+    report = progress or (lambda stage: None)
+    report("validate_bundle")
     with tempfile.TemporaryDirectory(prefix="newgame-bundle-") as temporary:
         stage_root = Path(temporary)
         manifest, manifest_bytes = _validate_and_stage_bundle(bundle_path, stage_root)
         manifest_sha256 = _sha256_bytes(manifest_bytes)
+        del manifest_bytes
         allowed_item_sources = set(manifest.get("item_sources", []))
         for row in manifest.get("items", []):
             if row.get("source") not in allowed_item_sources:
@@ -453,6 +458,7 @@ def import_bundle(
                 raise ValueError("删除标记缺少业务主键")
         media_plan, media_replacements = _media_plan(manifest, stage_root, raw_dir, icon_dir)
 
+        report("open_database")
         conn = connect(db_path)
         existing = conn.execute(
             "SELECT result_json FROM applied_bundles WHERE bundle_id=?",
@@ -482,6 +488,7 @@ def import_bundle(
         created_media: list[tuple[Path, Path]] = []
         replaced_media: list[tuple[Path, Path]] = []
         try:
+            report("write_source_items")
             begin_immediate_with_retry(conn)
             imported = 0
             for observed_at, group in grouped.items():
@@ -555,8 +562,11 @@ def import_bundle(
                         ),
                     )
 
+            report("rebuild_catalog")
             games = rebuild_catalog(conn, manage_transaction=False)
+            report("audit_catalog")
             completeness = audit_catalog_completeness(conn)
+            report("publish_media")
             media_backup_root = stage_root / ".media-backup"
             for index, (staged, target, root, replace_existing) in enumerate(media_plan):
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -599,6 +609,8 @@ def import_bundle(
                 "games": games,
                 "completeness": completeness,
                 "cursor": manifest.get("cursor", {}),
+                "media_cache": "deferred",
+                "postprocess_errors": [],
             }
             applied_at = datetime.now().astimezone().isoformat()
             if pipeline_run:
@@ -645,6 +657,7 @@ def import_bundle(
                     manifest_sha256, json.dumps(result, ensure_ascii=False, separators=(",", ":")),
                 ),
             )
+            report("commit")
             conn.commit()
         except Exception:
             conn.rollback()
@@ -653,6 +666,11 @@ def import_bundle(
             conn.close()
             raise
 
+        # 发布回执已经落库；默认不在入库进程内扫描全库和解码远程图片。
+        # 媒体任务使用独立的资源预算，避免网站与导入抢占整机内存。
+        if not cache_icons:
+            conn.close()
+            return result
         postprocess_errors = []
         icons = None
         screenshots = None
@@ -661,7 +679,7 @@ def import_bundle(
         except Exception as exc:  # 导入已发布，缓存失败降级记录。
             postprocess_errors.append(f"icon_cache: {exc}")
         try:
-            screenshots = cache_remote_screenshots(conn, screenshot_dir) if screenshot_dir else None
+            screenshots = cache_remote_screenshots(conn, screenshot_dir, workers=1) if screenshot_dir else None
         except Exception as exc:
             postprocess_errors.append(f"screenshot_cache: {exc}")
         result.update({"icons": icons, "screenshots": screenshots, "postprocess_errors": postprocess_errors})

@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from PIL import Image
 
-from .safe_download import download_bytes
+from .safe_download import UnsafeDownloadError, download_bytes
 
 
 HEADERS = {
@@ -19,13 +22,33 @@ HEADERS = {
 }
 
 
+def _download_urls(url: str) -> tuple[str, ...]:
+    parsed = urlsplit(url)
+    if (parsed.hostname or "").casefold() == "img-tc.tapimg.com" and parsed.path.startswith(
+        "/market/images/"
+    ) and "/_tap_appicon" not in parsed.path:
+        thumbnail = urlunsplit((
+            parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + "/_tap_appicon.jpg",
+            parsed.query, parsed.fragment,
+        ))
+        return url, thumbnail
+    return (url,)
+
+
 def _download_icon(url: str, icon_dir: Path) -> dict:
     now = datetime.now().astimezone().isoformat()
     try:
-        downloaded = download_bytes(
-            url, headers=HEADERS, max_bytes=5 * 1024 * 1024,
-            validate_image=True, max_pixels=16_000_000, max_dimension=8_000,
-        )
+        candidates = _download_urls(url)
+        for index, candidate in enumerate(candidates):
+            try:
+                downloaded = download_bytes(
+                    candidate, headers=HEADERS, max_bytes=5 * 1024 * 1024,
+                    validate_image=True, max_pixels=16_000_000, max_dimension=8_000,
+                )
+                break
+            except UnsafeDownloadError:
+                if index == len(candidates) - 1:
+                    raise
         image = Image.open(BytesIO(downloaded.content))
         image.seek(0)
         image.thumbnail((512, 512), Image.Resampling.LANCZOS)
@@ -34,7 +57,17 @@ def _download_icon(url: str, icon_dir: Path) -> dict:
         relative = Path("remote") / f"{hashlib.sha256(url.encode('utf-8')).hexdigest()[:32]}.webp"
         target = icon_dir / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        image.save(target, "WEBP", quality=88, method=4)
+        # 旧媒体文件可能由 root 写入；同目录原子替换可避免覆盖权限错误及半成品。
+        descriptor, temporary = tempfile.mkstemp(prefix=".icon-", suffix=".webp", dir=target.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                image.save(output, "WEBP", quality=88, method=4)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
         return {
             "source_url": url, "relative_path": relative.as_posix(), "status": "success",
             "http_status": downloaded.status_code, "content_type": downloaded.content_type,
@@ -48,7 +81,7 @@ def _download_icon(url: str, icon_dir: Path) -> dict:
         }
 
 
-def cache_remote_icons(conn: sqlite3.Connection, icon_dir: Path, workers: int = 8) -> dict:
+def cache_remote_icons(conn: sqlite3.Connection, icon_dir: Path, workers: int = 1) -> dict:
     icon_dir.mkdir(parents=True, exist_ok=True)
     urls = {
         row[0] for row in conn.execute(

@@ -255,6 +255,8 @@ footer p { margin: 0; font-weight: 500; letter-spacing: 0; }
 .drawer-hero p { margin: 0; color: var(--muted); font-size: 12px; }
 .drawer-follow { margin-top: 14px; height: 38px; border: 1px solid var(--ink); background: transparent; padding: 0 16px; font-size: 10px; font-weight: 800; cursor: pointer; }
 .drawer-follow.active { background: var(--acid); }
+.detail-status { padding: 24px 0; color: var(--muted); font-size: 14px; }
+.detail-placeholder { height: 88px; margin-top: 20px; border-radius: 8px; background: linear-gradient(var(--line) 0 12px, transparent 12px 28px, var(--line) 28px 40px, transparent 40px 56px, var(--line) 56px 68px, transparent 68px); opacity: .55; }
 .detail-follow-date { margin: 12px 0 0; color: var(--muted); font-size: 9px; text-align: right; font-variant-numeric: tabular-nums; }
 .detail-follow-date time { color: var(--ink); font-weight: 800; }
 .store-gallery { margin: 28px -18px 8px; padding: 22px 18px 20px; background: var(--ink); color: white; overflow: hidden; }

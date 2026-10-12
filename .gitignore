@@ -25,6 +25,7 @@ apk-inspect/
 *.raw
 *.tar
 *.tar.gz
+.deploy-*/
 
 # 本机专用运维脚本与验收记录
 scripts/run_simulator_daily.ps1

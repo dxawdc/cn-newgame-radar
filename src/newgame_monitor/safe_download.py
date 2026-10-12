@@ -119,7 +119,10 @@ def download_bytes(
                     continue
                 response.raise_for_status()
                 content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                if allowed_content_types and not any(
+                # 部分可信图片 CDN 把实际 PNG/WebP 返回为通用二进制类型。
+                # 仅在后续会进行图片解码和像素校验时接受这一类型。
+                opaque_image = validate_image and content_type == "application/octet-stream"
+                if allowed_content_types and not opaque_image and not any(
                     content_type.startswith(prefix) for prefix in allowed_content_types
                 ):
                     raise UnsafeDownloadError(f"响应类型不允许：{content_type or '(empty)'}")

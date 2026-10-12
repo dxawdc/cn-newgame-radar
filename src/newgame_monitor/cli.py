@@ -10,22 +10,7 @@ from pathlib import Path
 from .collectors import COLLECTORS
 from .catalog import audit_catalog_completeness, rebuild_catalog
 from .db import connect, upsert_items
-from .icon_cache import cache_remote_icons
-from .gallery import cache_remote_screenshots
-from .enrichment import (
-    backfill_full_descriptions,
-    enrich_haoyou_details,
-    enrich_9game_screenshots,
-    enrich_honor_cache_metadata,
-    enrich_name_lookup_fallback,
-    enrich_oppo_offline_media,
-    enrich_oppo_ui_snapshots,
-    enrich_huawei_public_details,
-    enrich_missing_4399,
-    enrich_taptap_descriptions,
-    enrich_vivo_public_details,
-    enrich_xiaomi_public_details,
-)
+from .detail_refresh import prepare_items, run_refresh
 from .event_quality import prune_legacy_haoyou_timeline, repair_233_launch_dates
 
 
@@ -71,6 +56,10 @@ def main() -> int:
     parser.add_argument("--raw-dir", type=Path, default=Path("raw"))
     parser.add_argument("--icon-dir", type=Path, default=Path("data/icons"))
     parser.add_argument("--screenshot-dir", type=Path, default=Path("data/screenshots"))
+    parser.add_argument("--detail-budget-seconds", type=float, default=1800,
+                        help="本轮增量详情补齐总预算，0 表示不设总时限")
+    parser.add_argument("--detail-max-products", type=int, default=0,
+                        help="本轮最多补齐产品数，0 表示全部候选")
     parser.add_argument(
         "--ui-details", action="store_true",
         help="逐项打开荣耀/OPPO 详情页，补开发商、标签和完整介绍",
@@ -97,6 +86,7 @@ def main() -> int:
 
     def begin_stage(stage: str, source: str = "") -> str:
         started_at = datetime.now().astimezone().isoformat()
+        print(f"[{started_at}] 开始阶段 {stage} {source}", flush=True)
         conn.execute(
             """
             INSERT INTO pipeline_stages(run_id,stage,source,started_at,status)
@@ -123,6 +113,7 @@ def main() -> int:
             ),
         )
         conn.commit()
+        print(f"[{datetime.now().astimezone().isoformat()}] 完成阶段 {stage} {source}: {status}", flush=True)
 
     for source in args.sources:
         begin_stage("collected", source)
@@ -143,7 +134,7 @@ def main() -> int:
             raw_path.mkdir(parents=True, exist_ok=True)
             for label, content in raw_responses:
                 (raw_path / f"{observed.strftime('%H%M%S')}-{label}.raw").write_bytes(content)
-            count = upsert_items(conn, items, observed.isoformat())
+            count = upsert_items(conn, prepare_items(conn, items), observed.isoformat())
             baselines = [
                 int(row["item_count"])
                 for row in conn.execute(
@@ -188,24 +179,15 @@ def main() -> int:
     stages = [
         ("quality", lambda: prune_legacy_haoyou_timeline(conn)),
         ("233_event_dates", lambda: repair_233_launch_dates(conn)),
-        ("enrichment", lambda: enrich_missing_4399(conn)),
-        ("descriptions", lambda: backfill_full_descriptions(conn)),
-        ("taptap_details", lambda: enrich_taptap_descriptions(conn)),
-        ("vivo_public_details", lambda: enrich_vivo_public_details(conn)),
-        ("haoyou_details", lambda: enrich_haoyou_details(conn)),
-        ("9game_screenshots", lambda: enrich_9game_screenshots(conn, args.raw_dir)),
-        ("huawei_public_details", lambda: enrich_huawei_public_details(conn)),
-        ("xiaomi_public_details", lambda: enrich_xiaomi_public_details(conn)),
+        ("incremental_details", lambda: run_refresh(
+            args.db, args.raw_dir, since=observed.isoformat(),
+            budget_seconds=args.detail_budget_seconds, max_products=args.detail_max_products,
+        )),
     ]
-    if "honor-ui" in args.sources:
-        stages.append(("honor_cache_metadata", lambda: enrich_honor_cache_metadata(conn)))
-    if "oppo-ui" in args.sources:
-        stages.append(("oppo_offline_media", lambda: enrich_oppo_offline_media(conn)))
-        # 历史 /sdcard 快照不得在日常采集中冒充本轮详情。
-        # 只有显式逐项回填时才读取；正常路径使用 ResourceDto 原图。
-        if args.ui_details:
-            stages.append(("oppo_ui_snapshots", lambda: enrich_oppo_ui_snapshots(conn)))
-    stages.append(("name_fallback", lambda: enrich_name_lookup_fallback(conn)))
+    if args.ui_details and "oppo-ui" in args.sources:
+        # 保留显式人工回填入口；日常定时任务不会读取历史 UI 快照。
+        from .enrichment import enrich_oppo_ui_snapshots
+        stages.append(("oppo_ui_snapshots", lambda: enrich_oppo_ui_snapshots(conn)))
 
     for stage, operation in stages:
         begin_stage(stage)
@@ -228,8 +210,6 @@ def main() -> int:
     if summary["catalog"]["status"] == "success":
         final_stages = [
             ("completeness", lambda: audit_catalog_completeness(conn)),
-            ("icons", lambda: cache_remote_icons(conn, args.icon_dir)),
-            ("screenshots", lambda: cache_remote_screenshots(conn, args.screenshot_dir)),
         ]
         for stage, operation in final_stages:
             begin_stage(stage)
@@ -240,6 +220,9 @@ def main() -> int:
             except Exception as exc:
                 summary[stage] = {"status": "failed", "error": str(exc)}
                 finish_stage(stage, "failed", summary[stage])
+
+    # 来源已给出的 URL 与本机 UI 素材照常发布；远程图片由服务器独立任务复用缓存。
+    summary["media"] = {"status": "deferred", "reason": "independent_server_media_job"}
 
     collector_statuses = [summary[source]["status"] for source in args.sources]
     publishable = any(status in {"success", "degraded"} for status in collector_statuses)

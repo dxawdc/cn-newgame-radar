@@ -953,12 +953,15 @@ def _node_by_text(root, text: str, *, max_top: int | None = None, min_top: int |
 def _wait_for_text_node(
     xml: bytes, text: str, *, dump_prefix: str, attempts: int = 6,
     delay_seconds: float = 3, max_top: int | None = None, min_top: int | None = None,
+    fallback=None,
 ):
     """等待异步加载的页面入口出现在 UI 树中，并返回节点及最新 UI。"""
     latest = xml
     for attempt in range(attempts):
         root = ET.fromstring(latest)
         node = _node_by_text(root, text, max_top=max_top, min_top=min_top)
+        if node is None and fallback is not None:
+            node = fallback(root)
         if node is not None:
             return node, latest
         if attempt < attempts - 1:
@@ -967,8 +970,41 @@ def _wait_for_text_node(
     return None, latest
 
 
+def _honor_new_tab_node(root):
+    """按稳定资源 ID 回退定位荣耀首页“新游”入口。"""
+    for node in root.iter("node"):
+        resource_id = node.get("resource-id", "")
+        if not resource_id.endswith("/tv_sub_indicator"):
+            continue
+        if _bounds(node)[1] <= 600:
+            return node
+    for node in root.iter("node"):
+        resource_id = node.get("resource-id", "")
+        if resource_id.endswith("/new_game_tab") and _bounds(node)[1] <= 600:
+            return node
+    return None
+
+
+def _honor_update_dismiss_node(root):
+    """识别荣耀游戏中心版本更新弹窗并返回“以后再说”按钮。"""
+    update_dialog = any(
+        (node.get("resource-id", "").endswith("/hwdialogpattern_content")
+         or (node.get("text") or "").strip() in {"发现新版本", "版本更新", "应用更新"})
+        for node in root.iter("node")
+    )
+    if not update_dialog:
+        return None
+    later_texts = {"以后再说", "稍后再说", "暂不更新", "取消"}
+    for node in root.iter("node"):
+        resource_id = node.get("resource-id", "")
+        text = (node.get("text") or "").strip()
+        if resource_id.endswith("/button1") or text in later_texts:
+            return node
+    return None
+
+
 def _dismiss_honor_home_overlays(xml: bytes, attempts: int = 3) -> bytes:
-    """关闭荣耀首页推荐弹窗，避免遮挡“新游”等主导航入口。"""
+    """关闭荣耀首页推荐及版本更新弹窗，避免遮挡“新游”等主导航入口。"""
     latest = xml
     for attempt in range(attempts):
         root = ET.fromstring(latest)
@@ -986,9 +1022,10 @@ def _dismiss_honor_home_overlays(xml: bytes, attempts: int = 3) -> bytes:
             ),
             None,
         )
-        if dialog is None or close is None:
+        action = close if dialog is not None and close is not None else _honor_update_dismiss_node(root)
+        if action is None:
             break
-        _tap_node(close)
+        _tap_node(action)
         time.sleep(1.5)
         latest = _dump_ui(f"honor-home-overlay-{attempt + 1}")
     return latest
@@ -1136,6 +1173,7 @@ def collect_honor_ui() -> tuple[list[dict], list[tuple[str, bytes]], dict]:
     start_xml = _dismiss_honor_home_overlays(start_xml)
     new_tab, start_xml = _wait_for_text_node(
         start_xml, "新游", dump_prefix="honor-home-ready", max_top=500,
+        fallback=_honor_new_tab_node,
     )
     if new_tab is None:
         raise ValueError("荣耀游戏中心首页未找到“新游”页签")
@@ -1157,7 +1195,8 @@ def collect_honor_ui() -> tuple[list[dict], list[tuple[str, bytes]], dict]:
     time.sleep(3)
     detail_seen: set[str] = set()
     launches, launch_raws, launch_coverage = _collect_vertical_ui(
-        "honor-launch", lambda xml: _parse_honor_list(xml, "launch"), detail_seen=detail_seen,
+        "honor-launch", lambda xml: _parse_honor_list(xml, "launch"),
+        max_swipes=12, detail_seen=detail_seen,
     )
 
     _adb("shell", "input", "keyevent", "4")
@@ -1176,7 +1215,8 @@ def collect_honor_ui() -> tuple[list[dict], list[tuple[str, bytes]], dict]:
     _tap_node(beta_entry)
     time.sleep(3)
     betas, beta_raws, beta_coverage = _collect_vertical_ui(
-        "honor-beta", lambda xml: _parse_honor_list(xml, "beta"), detail_seen=detail_seen,
+        "honor-beta", lambda xml: _parse_honor_list(xml, "beta"),
+        max_swipes=12, detail_seen=detail_seen,
     )
     items = launches + betas
     if not items:

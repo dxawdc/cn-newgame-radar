@@ -25,7 +25,7 @@ const state = {
   period: 'day', anchor: todayKey(), page: 1, pageSize: 24,
   sources: new Set(), events: new Set(), category: '', developer: '', q: '',
   dateFrom: '', dateTo: '', sort: 'event_desc', view: 'grid', total: 0, filters: null,
-  followed: false, currentDetailId: null,
+  followed: false, currentDetailId: null, detailController: null,
   dimension: initialQuery.get('view') === 'channel' ? 'channel' : 'product',
   auth: {user: null, csrfToken: '', favoriteCount: 0, permissions: {manage_users:false, manage_admins:false}},
   calendarStart: dateKey(startOfWeek(addDays(new Date(), -7))),
@@ -181,7 +181,7 @@ async function loadGames() {
     const pages = Math.max(1, Math.ceil(data.total / state.pageSize));
     $('#pageInfo').textContent = `${state.page} / ${pages}`;
     $('#prevPage').disabled = state.page <= 1; $('#nextPage').disabled = state.page >= pages;
-    $$('.game-card').forEach(card => card.addEventListener('click', () => openDetail(card.dataset.uuid)));
+    $$('.game-card').forEach((card, index) => card.addEventListener('click', () => openDetail(card.dataset.uuid, data.items[index])));
     $$('.card-follow').forEach(button => button.addEventListener('click', event => {
       event.stopPropagation(); toggleFavorite(button.dataset.followKey, button);
     }));
@@ -190,13 +190,53 @@ async function loadGames() {
   }
 }
 
-async function openDetail(gameUuid) {
+function detailPreview(game) {
+  if (!game) return '<h2>产品档案</h2>';
+  const icon = game.icon_url
+    ? `<img class="game-icon" src="${escapeHTML(game.icon_url)}" alt="${escapeHTML(game.name)} 图标">`
+    : `<span class="icon-fallback">${escapeHTML((game.name || '').slice(0, 1))}</span>`;
+  // 渠道卡片可能只含局部信息，此处不预填来源数、轨迹或关注状态。
+  return `<div class="drawer-hero">${icon}<div><p class="eyebrow">产品档案</p><h2>${escapeHTML(game.name)}</h2><p>${escapeHTML(game.developer || '开发商待补充')} · ${escapeHTML(game.category || '品类待补充')}</p></div></div>
+    ${game.intro ? `<section class="latest-intro"><h3>游戏简介</h3><p>${escapeHTML(game.intro)}</p></section>` : ''}`;
+}
+
+async function openDetail(gameUuid, preview = null) {
+  state.detailController?.abort();
+  const controller = new AbortController();
+  state.detailController = controller;
   state.galleryResizeObserver?.disconnect();
   state.galleryResizeObserver = null;
   state.currentDetailId = String(gameUuid);
-  $('#drawerContent').innerHTML = '<p>正在读取产品档案…</p>';
+  const content = $('#drawerContent');
+  const previewHTML = detailPreview(preview);
+  content.setAttribute('aria-busy', 'true');
+  content.innerHTML = `${previewHTML}<div class="detail-status" role="status"><p>正在补充完整介绍和渠道事件…</p><div class="detail-placeholder" aria-hidden="true"></div></div>`;
+  $('#detailDrawer').scrollTop = 0;
   $('#detailDrawer').classList.add('open'); $('#detailDrawer').setAttribute('aria-hidden','false'); $('#filterBackdrop').classList.add('open');
-  const game = await api(`/api/v2/games/${encodeURIComponent(gameUuid)}`);
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15000);
+  const isCurrent = () => state.detailController === controller && state.currentDetailId === String(gameUuid);
+  try {
+    const game = await api(`/api/v2/games/${encodeURIComponent(gameUuid)}`, {}, {signal: controller.signal});
+    if (!isCurrent()) return;
+    if (timedOut) throw new Error('详情读取超时，请重试。');
+    if (!game || game.error === 'not_found') throw new Error('暂未找到该游戏，请刷新列表后重试。');
+    renderDetail(game);
+  } catch (error) {
+    if (!isCurrent()) return;
+    const message = timedOut ? '详情读取超时，请重试。' : error.message;
+    content.innerHTML = `${previewHTML}<div class="detail-status" role="alert"><p>${escapeHTML(message || '详情读取失败，请重试。')}</p><button class="drawer-follow detail-retry" type="button">重新加载</button></div>`;
+    $('.detail-retry').addEventListener('click', () => openDetail(gameUuid, preview));
+  } finally {
+    clearTimeout(timeout);
+    if (isCurrent()) {
+      content.setAttribute('aria-busy', 'false');
+      state.detailController = null;
+    }
+  }
+}
+
+function renderDetail(game) {
   const icon = game.icon_url ? `<img class="game-icon" src="${escapeHTML(game.icon_url)}" alt="${escapeHTML(game.name)} 图标">` : `<span class="icon-fallback">${escapeHTML(game.name.slice(0,1))}</span>`;
   const latestIntro = game.latest_intro || (game.intro ? {text: game.intro, source_label: '聚合资料'} : null);
   const introMeta = latestIntro?.collected_at ? `${escapeHTML(latestIntro.source_label)} · 最近采集 ${fmtTime(latestIntro.collected_at)}` : escapeHTML(latestIntro?.source_label || '');
@@ -373,6 +413,9 @@ function closeLightbox() {
 }
 
 function closeOverlays() {
+  state.detailController?.abort();
+  state.detailController = null;
+  $('#drawerContent').setAttribute('aria-busy', 'false');
   $('#detailDrawer').classList.remove('open'); $('#detailDrawer').setAttribute('aria-hidden','true');
   $('#accountDrawer').classList.remove('open'); $('#accountDrawer').setAttribute('aria-hidden','true');
   $('#filtersPanel').classList.remove('open'); $('#filterBackdrop').classList.remove('open');

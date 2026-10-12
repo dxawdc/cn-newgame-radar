@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import tempfile
+import tracemalloc
 import unittest
 from pathlib import Path
 
@@ -15,6 +16,33 @@ from newgame_monitor.phase2_model import (
 
 
 class Phase2ModelTest(unittest.TestCase):
+    def test_large_raw_payloads_are_streamed_without_losing_snapshots_or_gallery(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conn = connect(Path(folder) / "test.db")
+            padding = "原始响应🧪" * 20000
+            items = [{
+                "source": "taptap", "source_item_id": str(index // 2),
+                "name": "内存回归游戏", "event_type": "beta" if index % 2 else "reservation",
+                "event_time": "2026-10-09", "raw": {
+                    "padding": padding,
+                    "detail_screenshots": [{"original_url": f"https://example.com/{index}.webp"}],
+                },
+            } for index in range(80)]
+            upsert_items(conn, items, "2026-10-09T07:00:00+08:00")
+            tracemalloc.start()
+            try:
+                self.assertEqual(rebuild_catalog(conn), 1)
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            self.assertLess(peak, 12 * 1024 * 1024)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM listing_snapshots").fetchone()[0], 80)
+            snapshot = json.loads(conn.execute("SELECT raw_json FROM listing_snapshots LIMIT 1").fetchone()[0])
+            self.assertEqual(json.loads(snapshot["raw_json"])["padding"], padding)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM media_assets WHERE asset_type='screenshot'").fetchone()[0], 80)
+            self.assertEqual(audit_phase2_model(conn)["status"], "ok")
+            conn.close()
+
     def test_uuid_survives_rename_and_legacy_id_redirects(self):
         with tempfile.TemporaryDirectory() as folder:
             conn = connect(Path(folder) / "test.db")

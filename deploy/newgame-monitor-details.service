@@ -1,0 +1,25 @@
+[Unit]
+Description=历史新游详情全量补齐（独立于每日发布）
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=newgame-monitor
+Group=newgame-monitor
+WorkingDirectory=/opt/newgame-monitor/current
+Environment=PYTHONPATH=/opt/newgame-monitor/current/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/flock -n /run/lock/newgame-monitor-collector.lock /opt/newgame-monitor/venv/bin/python -m newgame_monitor.detail_refresh history --db /var/lib/newgame-monitor/data/newgame_monitor.db --raw-dir /var/lib/newgame-monitor/raw --budget-seconds 1800 --max-products 0
+TimeoutStartSec=32min
+TimeoutStopSec=15s
+KillMode=control-group
+MemoryAccounting=true
+MemoryHigh=384M
+MemoryMax=512M
+MemorySwapMax=0
+CPUQuota=70%
+IOWeight=10
+Nice=15
+TasksMax=48
+OOMPolicy=stop
+NoNewPrivileges=true

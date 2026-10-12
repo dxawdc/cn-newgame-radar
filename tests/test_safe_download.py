@@ -97,6 +97,36 @@ class SafeDownloadTest(unittest.TestCase):
                 allowed_hosts={"cdn.example"}, resolver=public_resolver, session=session,
             )
 
+    def test_octet_stream_requires_validated_image(self):
+        buffer = BytesIO()
+        Image.new("RGB", (10, 10), "red").save(buffer, "PNG")
+        valid = FakeSession([FakeResponse(
+            content=buffer.getvalue(), headers={"content-type": "application/octet-stream"},
+        )])
+        result = download_bytes(
+            "https://cdn.example/a.png", validate_image=True,
+            allowed_hosts={"cdn.example"}, resolver=public_resolver, session=valid,
+        )
+        self.assertEqual(result.content_type, "application/octet-stream")
+
+        invalid = FakeSession([FakeResponse(
+            content=b"not-an-image", headers={"content-type": "application/octet-stream"},
+        )])
+        with self.assertRaisesRegex(UnsafeDownloadError, "可解析图片"):
+            download_bytes(
+                "https://cdn.example/a.png", validate_image=True,
+                allowed_hosts={"cdn.example"}, resolver=public_resolver, session=invalid,
+            )
+
+        unvalidated = FakeSession([FakeResponse(
+            content=buffer.getvalue(), headers={"content-type": "application/octet-stream"},
+        )])
+        with self.assertRaisesRegex(UnsafeDownloadError, "响应类型"):
+            download_bytes(
+                "https://cdn.example/a.png", validate_image=False,
+                allowed_hosts={"cdn.example"}, resolver=public_resolver, session=unvalidated,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

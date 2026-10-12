@@ -102,7 +102,13 @@ class SimulatorSyncTest(unittest.TestCase):
                 observed,
             )
             target.close()
-            imported = import_bundle(bundle, target_db, target_raw, target_icons, cache_icons=False)
+            with patch('newgame_monitor.simulator_sync.cache_remote_icons') as icons, patch(
+                'newgame_monitor.simulator_sync.cache_remote_screenshots'
+            ) as screenshots:
+                imported = import_bundle(bundle, target_db, target_raw, target_icons, root / 'screenshots')
+                icons.assert_not_called()
+                screenshots.assert_not_called()
+            self.assertEqual(imported['media_cache'], 'deferred')
             self.assertEqual(imported["items"], 2)
             self.assertEqual(imported["runs"], 4)
             self.assertTrue((target_icons / "ui" / "honor_gamecenter" / "honor-1.webp").is_file())

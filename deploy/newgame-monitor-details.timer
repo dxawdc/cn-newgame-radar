@@ -1,0 +1,10 @@
+[Unit]
+Description=每日错峰全量补齐历史新游详情
+
+[Timer]
+OnCalendar=*-*-* 10:30:00 Asia/Shanghai
+Persistent=false
+Unit=newgame-monitor-details.service
+
+[Install]
+WantedBy=timers.target

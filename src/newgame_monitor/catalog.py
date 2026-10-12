@@ -777,7 +777,13 @@ def rebuild_catalog(conn: sqlite3.Connection, *, manage_transaction: bool = True
                 [(item_id,) for item_id in invalid_ids],
             )
 
-        rows = list(conn.execute("SELECT * FROM source_items ORDER BY id"))
+        # 目录归并不需要原始响应和长详情，避免将历史大字段常驻内存。
+        rows = list(conn.execute("""
+            SELECT id,source,source_item_id,name,package_name,developer,category,
+              tags_json,gameplay_intro,icon_url,detail_url,rating,event_type,
+              first_seen_at,last_seen_at,canonical_key
+            FROM source_items ORDER BY id
+        """))
         previous_games = list(conn.execute(
             "SELECT id,game_uuid,canonical_key FROM canonical_games"
         ))

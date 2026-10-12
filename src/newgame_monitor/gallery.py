@@ -129,7 +129,8 @@ def gallery_urls_from_rows(rows) -> list[tuple[str, str]]:
     seen: set[str] = set()
     for row in rows:
         raw_json = row["raw_json"] if "raw_json" in row.keys() else {}
-        for url in extract_gallery_urls(row["source"], raw_json):
+        urls = row["_gallery_urls"] if "_gallery_urls" in row.keys() else extract_gallery_urls(row["source"], raw_json)
+        for url in urls:
             if url not in seen:
                 seen.add(url)
                 result.append((row["source"], url))
@@ -166,12 +167,19 @@ def _download(url: str, screenshot_dir: Path) -> dict:
 
 
 def cache_remote_screenshots(
-    conn: sqlite3.Connection, screenshot_dir: Path, workers: int = 6,
+    conn: sqlite3.Connection, screenshot_dir: Path, workers: int = 1,
+    batch_size: int = 32,
 ) -> dict:
     screenshot_dir.mkdir(parents=True, exist_ok=True)
     urls: set[str] = set()
-    for row in conn.execute("SELECT source, raw_json FROM source_items"):
-        urls.update(extract_gallery_urls(row["source"], row["raw_json"])[:5])
+    # 新近变更的产品优先处理；全库媒体任务不应让新增详情排在旧失败 URL 后面。
+    priority: dict[str, int] = {}
+    for order, row in enumerate(conn.execute(
+        "SELECT source, raw_json FROM source_items ORDER BY updated_at DESC, id DESC"
+    )):
+        for url in extract_gallery_urls(row["source"], row["raw_json"])[:5]:
+            urls.add(url)
+            priority.setdefault(url, order)
     successful = {
         row[0]: row[1] for row in conn.execute(
             "SELECT source_url, relative_path FROM screenshot_assets WHERE status='success'"
@@ -210,15 +218,17 @@ def cache_remote_screenshots(
                 discovered,
             )
     pending = sorted(
-        url for url in urls - set(successful)
-        if url.startswith(("https://", "http://"))
+        (url for url in urls - set(successful)
+         if url.startswith(("https://", "http://"))),
+        key=lambda url: (priority.get(url, 10**9), url),
     )
-    results = []
-    if pending:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_download, url, screenshot_dir): url for url in pending}
-            for future in as_completed(futures):
-                results.append(future.result())
+    downloaded = failed = 0
+    batch_size = max(1, batch_size)
+    for offset in range(0, len(pending), batch_size):
+        batch = pending[offset:offset + batch_size]
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = [pool.submit(_download, url, screenshot_dir) for url in batch]
+            results = [future.result() for future in as_completed(futures)]
         with conn:
             conn.executemany(
                 """
@@ -236,12 +246,12 @@ def cache_remote_screenshots(
                 """,
                 results,
             )
+        downloaded += sum(item["status"] == "success" for item in results)
+        failed += sum(item["status"] == "failed" for item in results)
     return {
         "known": len(urls),
-        "cached": len(urls & set(successful)) + sum(
-            item["status"] == "success" for item in results
-        ),
-        "downloaded": sum(item["status"] == "success" for item in results),
+        "cached": len(urls & set(successful)) + downloaded,
+        "downloaded": downloaded,
         "discovered": len(discovered),
-        "failed": sum(item["status"] == "failed" for item in results),
+        "failed": failed,
     }

@@ -1,0 +1,25 @@
+[Unit]
+Description=新游媒体缓存（单并发、独立资源限制）
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=newgame-monitor
+Group=newgame-monitor
+WorkingDirectory=/opt/newgame-monitor/current
+Environment=PYTHONPATH=/opt/newgame-monitor/current/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/flock -w 60 /run/lock/newgame-monitor-collector.lock /opt/newgame-monitor/venv/bin/python -m newgame_monitor.import_job media
+TimeoutStartSec=30min
+TimeoutStopSec=15s
+KillMode=control-group
+MemoryAccounting=true
+MemoryHigh=256M
+MemoryMax=384M
+MemorySwapMax=0
+CPUQuota=50%
+IOWeight=10
+Nice=15
+TasksMax=24
+OOMPolicy=stop
+NoNewPrivileges=true
