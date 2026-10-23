@@ -4,6 +4,14 @@
 
 > 本仓库只包含源码、通用配置示例、测试和部署模板。数据库、账号数据、Cookie/Token、原始抓取证据、商店图片缓存、APK、日志、本机路径及私有部署配置均不在版本库中。
 
+<!-- caige-author:start -->
+**作者：才哥** · 微信公众号：**可以叫我才哥**
+
+微信扫码关注：
+
+<img src="assets/caige-wechat-qrcode.jpg" alt="微信公众号「可以叫我才哥」扫码关注二维码" width="172" height="172" />
+<!-- caige-author:end -->
+
 ## 核心能力
 
 - **多渠道采集**：覆盖 TapTap、华为、荣耀、小米、OPPO、vivo、4399、233 乐园、好游快爆、UC 九游和 App Store 中国区。
